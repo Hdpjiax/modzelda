@@ -1,0 +1,5 @@
+=== Zelda OoT Triforce Mod Menu Log (2026-11-15T23:28:51.048242) ===
+[23:28:51.275] [OK] Conectado al proceso de Hookshot [PID: 18252]
+[23:28:51.283] [OK] Estructura de Link verificada en hookshot_vk.dll (0x7FFC53675614) en 0.007s
+[23:28:51.283] [OK]   Rupias=200, Salud=20 corazones, Magia=96/96, Flechas=12, Bombas=3
+[23:28:51.722] [INFO] Triforce Engine v4.8 listo y activo.

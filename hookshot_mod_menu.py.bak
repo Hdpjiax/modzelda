@@ -1,0 +1,2056 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+===============================================================================
+  HOOKSHOT v2.2.0-rc.1 — TRIFORCE ENGINE OVERLAY & LIVE MEMORY TRAINER (v3.0)
+  Target: The Legend of Zelda: Ocarina of Time (Switch 2 Native PC Port)
+  Program ID: 0400486024DEC000 | Update: v131072 | Build: e0f3ccfa (E0F3CCFAF50065AE)
+  Release Reference: https://git.notrexed.dev/Hookshot/Hookshot/releases/tag/v2.2.0-rc.1
+===============================================================================
+"""
+
+import os
+import sys
+import json
+import time
+import socket
+import struct
+import ctypes
+from ctypes import wintypes
+import threading
+import subprocess
+from datetime import datetime
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+
+# =============================================================================
+# MAPA DE MEMORIA DE HOOKSHOT (host/hos_main.c, host/hos_mem.c, host/hos.h)
+# =============================================================================
+# En Hookshot (recompilación estática de Switch 2 OoT v131072):
+#   - 0x01000000 .. 0x07000000 : Área del sistema (pila principal y bloques TLS)
+#   - 0x80000000               : Base de imagen del invitado (image.bin / BSS)
+#   - 0x1000000000             : Inicio del Heap del invitado (crece hacia arriba)
+#   - Las páginas dentro de la ventana de 512 GB se reservan con MEM_RESERVE y
+#     se comprometen bajo demanda (MEM_COMMIT) cuando el juego carga la partida.
+GUEST_IMAGE_BASE = 0x80000000
+GUEST_HEAP_BASE  = 0x1000000000
+
+# Perfiles conocidos del puntero de inventario/jugador en el Heap (alineados a 0x1000)
+KNOWN_HEAP_OFFSETS = [
+    0x7F37C000,  # Perfil A -> 0x107F37C000
+    0x7C66C000,  # Perfil B -> 0x107C66C000
+]
+
+# Desplazamientos dentro de la estructura de Link (Build E0F3CCFAF50065AE)
+# Nota: cur_health (+0x158/+0x15C/+0x160) y max_health (+0x180/+0x184/+0x188)
+# están separados exactamente por 0x28 (40) bytes.
+STRUCT_OFFSETS = {
+    "rupees":       0x134,  # uint32 (0..9999)
+    "cur_health_1": 0x158,  # uint32 (4 unidades = 1 corazón; 18 corazones = 72 = 0x48; 20 = 80 = 0x50)
+    "cur_health_2": 0x15C,  # uint32
+    "cur_health_3": 0x160,  # uint32
+    "max_health_1": 0x180,  # uint32 (4 unidades = 1 corazón; 20 corazones = 80 = 0x50)
+    "max_health_2": 0x184,  # uint32
+    "max_health_3": 0x188,  # uint32
+    "cur_magic":    0x190,  # uint32 (0x30 = barra normal, 0x60 = barra doble)
+    "max_magic":    0x194,  # uint32 (0x30 / 0x60)
+    "magic_flag":   0x198,  # uint32 (1 = normal, 2 = doble magia)
+    "arrows":       0x814,  # uint32 (Flechas equipadas en el arco, ej. 17)
+    "bombs":        0x83C,  # uint32
+    "bombchus":     0x8DC,  # uint32
+    "deku_nuts":    0xA1C,  # uint32
+    "deku_seeds":   0xA44,  # uint32
+    "deku_sticks":  0xA6C,  # uint32
+    "magic_beans":  0xC24,  # uint32
+}
+
+OFFSET_CHEAT_FLAGS = 0x04E9FF80
+
+# =============================================================================
+# CATÁLOGO COMPLETO DE 36 DESTINOS DE TELETRANSPORTE (SIN REQUISITO DE VISITA)
+# =============================================================================
+TELEPORT_DESTINATIONS = [
+    {"idx": 0,  "id": "link_house",            "cat": "Ciudades y Aldeas",   "name": "Casa de Link (Bosque Kokiri)",               "map": 0x34, "spawn": 0},
+    {"idx": 1,  "id": "kokiri_forest",         "cat": "Ciudades y Aldeas",   "name": "Bosque Kokiri (Exterior Principal)",         "map": 0x55, "spawn": 0},
+    {"idx": 2,  "id": "hyrule_field",          "cat": "Exteriores de Hyrule", "name": "Pradera de Hyrule (Salida del Bosque)",      "map": 0x51, "spawn": 0},
+    {"idx": 3,  "id": "market_entrance",       "cat": "Ciudadela y Castillo", "name": "Afueras de la Ciudadela (Puente Levadizo)",  "map": 0x1D, "spawn": 0},
+    {"idx": 4,  "id": "market_square",         "cat": "Ciudadela y Castillo", "name": "Plaza del Mercado de la Ciudadela",          "map": 0x20, "spawn": 0},
+    {"idx": 5,  "id": "temple_of_time_ext",    "cat": "Ciudadela y Castillo", "name": "Exterior del Templo del Tiempo",             "map": 0x53, "spawn": 0},
+    {"idx": 6,  "id": "temple_of_time_int",    "cat": "Ciudadela y Castillo", "name": "Interior del Templo del Tiempo (Pedestal)",  "map": 0x43, "spawn": 0},
+    {"idx": 7,  "id": "hyrule_castle_ext",     "cat": "Ciudadela y Castillo", "name": "Afueras del Castillo de Hyrule / Jardines",  "map": 0x5F, "spawn": 0},
+    {"idx": 8,  "id": "ganons_castle_ext",     "cat": "Ciudadela y Castillo", "name": "Afueras del Castillo de Ganon (Cráter)",     "map": 0x64, "spawn": 0},
+    {"idx": 9,  "id": "lon_lon_ranch",         "cat": "Exteriores de Hyrule", "name": "Rancho Lon Lon (Exterior)",                  "map": 0x63, "spawn": 0},
+    {"idx": 10, "id": "kakariko_village",      "cat": "Ciudades y Aldeas",   "name": "Aldea Kakariko (Entrada Principal)",         "map": 0x52, "spawn": 0},
+    {"idx": 11, "id": "kakariko_graveyard",    "cat": "Ciudades y Aldeas",   "name": "Cementerio de Kakariko (Exterior)",          "map": 0x53, "spawn": 1},
+    {"idx": 12, "id": "lost_woods",            "cat": "Exteriores de Hyrule", "name": "Bosques Perdidos (Lost Woods)",              "map": 0x5B, "spawn": 0},
+    {"idx": 13, "id": "sacred_forest_meadow",  "cat": "Afueras de Templos",   "name": "Pradera Sagrada del Bosque (Entrada Templo)","map": 0x56, "spawn": 0},
+    {"idx": 14, "id": "death_mountain_trail",  "cat": "Exteriores de Hyrule", "name": "Sendero de la Montaña de la Muerte",         "map": 0x60, "spawn": 0},
+    {"idx": 15, "id": "goron_city",            "cat": "Ciudades y Aldeas",   "name": "Ciudad Goron (Entrada)",                     "map": 0x62, "spawn": 0},
+    {"idx": 16, "id": "death_mountain_crater", "cat": "Afueras de Templos",   "name": "Cráter de la Montaña de la Muerte",          "map": 0x61, "spawn": 0},
+    {"idx": 17, "id": "zoras_river",           "cat": "Exteriores de Hyrule", "name": "Río Zora (Cascada)",                         "map": 0x54, "spawn": 0},
+    {"idx": 18, "id": "zoras_domain",          "cat": "Ciudades y Aldeas",   "name": "Dominio de los Zora (Sala del Rey)",         "map": 0x58, "spawn": 0},
+    {"idx": 19, "id": "zoras_fountain",        "cat": "Afueras de Templos",   "name": "Fuente Zora (Frente a Jabu-Jabu / Hielo)",   "map": 0x59, "spawn": 0},
+    {"idx": 20, "id": "lake_hylia",            "cat": "Afueras de Templos",   "name": "Lago Hylia (Exterior del Templo del Agua)",  "map": 0x57, "spawn": 0},
+    {"idx": 21, "id": "gerudo_valley",         "cat": "Exteriores de Hyrule", "name": "Valle Gerudo (Puente)",                      "map": 0x5A, "spawn": 0},
+    {"idx": 22, "id": "gerudo_fortress",       "cat": "Ciudades y Aldeas",   "name": "Fortaleza de las Gerudo (Exterior)",         "map": 0x5D, "spawn": 0},
+    {"idx": 23, "id": "haunted_wasteland",     "cat": "Exteriores de Hyrule", "name": "Desierto Encantado (Haunted Wasteland)",     "map": 0x5E, "spawn": 0},
+    {"idx": 24, "id": "desert_colossus",       "cat": "Afueras de Templos",   "name": "Coloso del Desierto (Exterior Espíritu)",    "map": 0x5C, "spawn": 0},
+    {"idx": 25, "id": "deku_tree",             "cat": "Interior Mazmorras",   "name": "Interior: Gran Árbol Deku",                  "map": 0x00, "spawn": 0},
+    {"idx": 26, "id": "dodongos_cavern",       "cat": "Interior Mazmorras",   "name": "Interior: Caverna de los Dodongo",           "map": 0x01, "spawn": 0},
+    {"idx": 27, "id": "jabu_jabu",             "cat": "Interior Mazmorras",   "name": "Interior: Tripa de Jabu-Jabu",               "map": 0x02, "spawn": 0},
+    {"idx": 28, "id": "forest_temple",         "cat": "Interior Templos",     "name": "Interior: Templo del Bosque",                "map": 0x03, "spawn": 0},
+    {"idx": 29, "id": "fire_temple",           "cat": "Interior Templos",     "name": "Interior: Templo del Fuego",                 "map": 0x04, "spawn": 0},
+    {"idx": 30, "id": "water_temple",          "cat": "Interior Templos",     "name": "Interior: Templo del Agua",                  "map": 0x05, "spawn": 0},
+    {"idx": 31, "id": "spirit_temple",         "cat": "Interior Templos",     "name": "Interior: Templo del Espíritu",              "map": 0x06, "spawn": 0},
+    {"idx": 32, "id": "shadow_temple",         "cat": "Interior Templos",     "name": "Interior: Templo de las Sombras",            "map": 0x07, "spawn": 0},
+    {"idx": 33, "id": "bottom_of_the_well",    "cat": "Interior Mazmorras",   "name": "Interior: Fondo del Pozo (Kakariko)",        "map": 0x08, "spawn": 0},
+    {"idx": 34, "id": "ice_cavern",            "cat": "Interior Mazmorras",   "name": "Interior: Caverna de Hielo",                 "map": 0x09, "spawn": 0},
+    {"idx": 35, "id": "ganons_castle_int",     "cat": "Interior Templos",     "name": "Interior: Torre y Castillo de Ganon",        "map": 0x0A, "spawn": 0},
+]
+
+
+# =============================================================================
+# SISTEMA CENTRALIZADO DE LOGS Y TELEMETRÍA EN VIVO
+# =============================================================================
+class LiveLogger:
+    def __init__(self, log_file_path="hookshot_modmenu_debug.log"):
+        self.log_file_path = os.path.abspath(log_file_path)
+        self.entries = []
+        self.listeners = []
+        self.lock = threading.Lock()
+        try:
+            with open(self.log_file_path, "w", encoding="utf-8") as f:
+                f.write(f"=== Hookshot v2.2.0-rc.1 Mod Menu Diagnostic Log ({datetime.now().isoformat()}) ===\n")
+        except Exception:
+            pass
+
+    def add_listener(self, callback):
+        self.listeners.append(callback)
+
+    def log(self, level, msg):
+        ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        line = f"[{ts}] [{level}] {msg}"
+        with self.lock:
+            self.entries.append((level, line))
+            if len(self.entries) > 600:
+                self.entries.pop(0)
+            try:
+                with open(self.log_file_path, "a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+            except Exception:
+                pass
+        for cb in self.listeners:
+            try:
+                cb(level, line)
+            except Exception:
+                pass
+
+    def info(self, msg):
+        self.log("INFO", msg)
+
+    def ok(self, msg):
+        self.log("OK", msg)
+
+    def warn(self, msg):
+        self.log("WARN", msg)
+
+    def err(self, msg):
+        self.log("ERROR", msg)
+
+
+# =============================================================================
+# ESTRUCTURAS NATIVAS WIN32 (64-BIT) PARA INSPECCIÓN SIN SUBPROCESOS
+# =============================================================================
+class MEMORY_BASIC_INFORMATION64(ctypes.Structure):
+    _fields_ = [
+        ("BaseAddress",       ctypes.c_ulonglong),
+        ("AllocationBase",    ctypes.c_ulonglong),
+        ("AllocationProtect", wintypes.DWORD),
+        (" __alignment1",     wintypes.DWORD),
+        ("RegionSize",        ctypes.c_ulonglong),
+        ("State",             wintypes.DWORD),
+        ("Protect",           wintypes.DWORD),
+        ("Type",              wintypes.DWORD),
+        (" __alignment2",     wintypes.DWORD),
+    ]
+
+
+class PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [
+        ("dwSize",              wintypes.DWORD),
+        ("cntUsage",            wintypes.DWORD),
+        ("th32ProcessID",       wintypes.DWORD),
+        ("th32DefaultHeapID",   ctypes.c_size_t),
+        ("th32ModuleID",        wintypes.DWORD),
+        ("cntThreads",          wintypes.DWORD),
+        ("th32ParentProcessID", wintypes.DWORD),
+        ("pcPriClassBase",      wintypes.LONG),
+        ("dwFlags",             wintypes.DWORD),
+        ("szExeFile",           wintypes.WCHAR * 260),
+    ]
+
+
+# =============================================================================
+# MOTOR DE MEMORIA INTER-PROCESO CON AUTO-DETECCIÓN CONTINUA Y ESCÁNER DE HEAP
+# =============================================================================
+class ExternalProcessMemory:
+    def __init__(self, logger: LiveLogger):
+        self.log = logger
+        self.pid = None
+        self.process_handle = None
+        self.process_name = ""
+        self.exe_full_path = ""
+        self.committed_mb = 0
+        self.reserved_gb = 0.0
+        self.is_windows = sys.platform.startswith("win")
+        self.player_struct_addr = GUEST_HEAP_BASE + KNOWN_HEAP_OFFSETS[0]
+        self.active_health_slot = 1  # 1 -> +0x158/+0x180, 2 -> +0x15C/+0x184, 3 -> +0x160/+0x188
+        self.struct_verified = False
+        self.last_error_code = 0
+        self._last_pid_poll = 0.0
+        self._last_auto_probe = 0.0
+        self._warned_title_screen = False
+
+    def _query_process_memory_stats(self, handle):
+        """
+        Usa VirtualQueryEx para calcular cuánta memoria RW comprometida (MEM_COMMIT)
+        y cuánta memoria virtual reservada (ej. la ventana de 512 GB de Hookshot)
+        tiene un proceso en tiempo real, sin llamar a tasklist.exe.
+        """
+        if not self.is_windows or not handle:
+            return 0, 0.0
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.VirtualQueryEx.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.POINTER(MEMORY_BASIC_INFORMATION64), ctypes.c_size_t
+        ]
+        kernel32.VirtualQueryEx.restype = ctypes.c_size_t
+
+        mbi = MEMORY_BASIC_INFORMATION64()
+        curr = 0x10000
+        max_user_addr = 0x7FFFFFFFFFFF
+        MEM_COMMIT = 0x1000
+        MEM_RESERVE = 0x2000
+        committed_bytes = 0
+        reserved_bytes = 0
+
+        while curr < max_user_addr:
+            res = kernel32.VirtualQueryEx(
+                ctypes.c_void_p(handle),
+                ctypes.c_void_p(curr),
+                ctypes.byref(mbi),
+                ctypes.sizeof(mbi)
+            )
+            if not res or mbi.RegionSize == 0:
+                break
+            if mbi.State == MEM_COMMIT:
+                committed_bytes += mbi.RegionSize
+            elif mbi.State == MEM_RESERVE:
+                reserved_bytes += mbi.RegionSize
+            next_addr = mbi.BaseAddress + mbi.RegionSize
+            if next_addr <= curr:
+                break
+            curr = next_addr
+
+        return int(committed_bytes // (1024 * 1024)), round((committed_bytes + reserved_bytes) / (1024 ** 3), 1)
+
+    def _get_win32_process_path(self, handle):
+        """Obtiene la ruta completa del ejecutable (ej. ...\\bin\\hookshot.exe)."""
+        if not self.is_windows or not handle:
+            return ""
+        try:
+            buf_len = wintypes.DWORD(1024)
+            buf = ctypes.create_unicode_buffer(1024)
+            res = ctypes.windll.kernel32.QueryFullProcessImageNameW(
+                ctypes.c_void_p(handle), 0, buf, ctypes.byref(buf_len)
+            )
+            if res:
+                return buf.value
+        except Exception:
+            pass
+        return ""
+
+    def list_candidate_processes(self):
+        """
+        Enumera todos los procesos de Hookshot/Longshot usando la API nativa Win32
+        `CreateToolhelp32Snapshot` (0 ms de sobrecarga, sin abrir consolas ni tasklist).
+        Prioriza explícitamente:
+          1. Procesos ubicados en `...\\bin\\hookshot.exe`
+          2. Procesos con la ventana de 512 GB reservada o mayor memoria comprometida.
+        """
+        target_names = {"hookshot.exe", "hookshot", "longshot.exe", "longshot"}
+        candidates = []
+
+        if self.is_windows:
+            TH32CS_SNAPPROCESS = 0x00000002
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            PROCESS_VM_READ = 0x0010
+            kernel32 = ctypes.windll.kernel32
+            kernel32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+            kernel32.OpenProcess.restype = ctypes.c_void_p
+
+            snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+            if not snap or snap == ctypes.c_void_p(-1).value:
+                return []
+
+            try:
+                pe = PROCESSENTRY32W()
+                pe.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+                has_proc = kernel32.Process32FirstW(ctypes.c_void_p(snap), ctypes.byref(pe))
+                matched_pids = set()
+
+                while has_proc:
+                    exe_name = pe.szExeFile.lower()
+                    pid = int(pe.th32ProcessID)
+                    ppid = int(pe.th32ParentProcessID)
+
+                    if pid != os.getpid() and (exe_name in target_names or ppid in matched_pids):
+                        matched_pids.add(pid)
+                        h_temp = kernel32.OpenProcess(
+                            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, False, pid
+                        )
+                        full_path = ""
+                        comm_mb = 0
+                        res_gb = 0.0
+                        if h_temp:
+                            full_path = self._get_win32_process_path(h_temp)
+                            comm_mb, res_gb = self._query_process_memory_stats(h_temp)
+                            kernel32.CloseHandle(ctypes.c_void_p(h_temp))
+
+                        is_bin_exe = ("\\bin\\" in full_path.lower()) or ("/bin/" in full_path.lower())
+                        has_guest_arena = (res_gb >= 64.0)
+                        # Puntuación para elegir siempre el motor real del juego y nunca el stub launcher
+                        score = (
+                            (1000000 if has_guest_arena else 0)
+                            + (500000 if is_bin_exe else 0)
+                            + comm_mb
+                        )
+                        candidates.append({
+                            "score": score,
+                            "pid": pid,
+                            "name": pe.szExeFile,
+                            "path": full_path or pe.szExeFile,
+                            "committed_mb": comm_mb,
+                            "reserved_gb": res_gb,
+                            "is_bin": is_bin_exe,
+                        })
+                    has_proc = kernel32.Process32NextW(ctypes.c_void_p(snap), ctypes.byref(pe))
+            finally:
+                kernel32.CloseHandle(ctypes.c_void_p(snap))
+        else:
+            try:
+                out = subprocess.check_output(["ps", "-eo", "pid,rss,comm,args"], text=True)
+                for line in out.strip().splitlines()[1:]:
+                    parts = line.split(None, 3)
+                    if len(parts) >= 3:
+                        pid = int(parts[0])
+                        rss_mb = int(parts[1]) // 1024
+                        comm = parts[2]
+                        args = parts[3] if len(parts) > 3 else comm
+                        if pid == os.getpid():
+                            continue
+                        if any(t in comm.lower() or f"bin/{t}" in args.lower() for t in target_names):
+                            is_bin = "bin/" in args.lower()
+                            candidates.append({
+                                "score": (500000 if is_bin else 0) + rss_mb,
+                                "pid": pid,
+                                "name": comm,
+                                "path": args,
+                                "committed_mb": rss_mb,
+                                "reserved_gb": 512.0 if is_bin else 0.0,
+                                "is_bin": is_bin,
+                            })
+            except Exception:
+                pass
+
+        candidates.sort(key=lambda c: c["score"], reverse=True)
+        return candidates
+
+    def find_real_game_pid(self):
+        candidates = self.list_candidate_processes()
+        if not candidates:
+            return None, "", None
+        best = candidates[0]
+        tag_bin = " [bin\\hookshot.exe]" if best["is_bin"] else ""
+        desc = f"{best['name']}{tag_bin} ({best['committed_mb']} MB RAM | {best['reserved_gb']:.0f} GB Virtual)"
+        return best["pid"], desc, best
+
+    def is_handle_alive(self):
+        if not self.pid:
+            return False
+        if not self.is_windows:
+            return os.path.exists(f"/proc/{self.pid}")
+        if not self.process_handle:
+            return False
+        WAIT_TIMEOUT = 0x00000102
+        res = ctypes.windll.kernel32.WaitForSingleObject(ctypes.c_void_p(self.process_handle), 0)
+        return res == WAIT_TIMEOUT
+
+    def attach(self):
+        now = time.time()
+        # Si ya tenemos un handle vivo, solo re-evaluamos procesos cada 2.5 segundos
+        # para actualizar estadísticas de RAM o cambiar si se abrió un hijo bin/hookshot.exe más grande
+        if self.is_handle_alive() and (now - self._last_pid_poll < 2.5):
+            # Si aún no se verificó la estructura (ej. estaba en la pantalla de título "Continuar"),
+            # re-intentar localizarla automáticamente cada 2.5 segundos sin bloquear
+            if not self.struct_verified and (now - self._last_auto_probe >= 2.5):
+                self._last_auto_probe = now
+                self.verify_and_locate_player_struct(silent_if_menu=True)
+            return True
+
+        self._last_pid_poll = now
+        pid, desc, info = self.find_real_game_pid()
+        if not pid:
+            if self.pid is not None:
+                self.log.warn("El proceso de Hookshot se cerró. Esperando nueva ejecución...")
+            self.detach()
+            return False
+
+        # Si sigue siendo el mismo PID y el handle sigue vivo, actualizamos solo la estadística de RAM
+        if self.pid == pid and self.is_handle_alive():
+            self.process_name = desc
+            if info:
+                self.committed_mb = info["committed_mb"]
+                self.reserved_gb = info["reserved_gb"]
+                self.exe_full_path = info["path"]
+            if not self.struct_verified and (now - self._last_auto_probe >= 2.5):
+                self._last_auto_probe = now
+                self.verify_and_locate_player_struct(silent_if_menu=True)
+            return True
+
+        self.detach()
+        self.pid = pid
+        self.process_name = desc
+        if info:
+            self.committed_mb = info["committed_mb"]
+            self.reserved_gb = info["reserved_gb"]
+            self.exe_full_path = info["path"]
+
+        if self.is_windows:
+            PROCESS_ALL_ACCESS = 0x001F0FFF
+            PROCESS_RW_QUERY = 0x0010 | 0x0020 | 0x0008 | 0x0400 | 0x1000
+            kernel32 = ctypes.windll.kernel32
+            kernel32.OpenProcess.restype = ctypes.c_void_p
+
+            handle = kernel32.OpenProcess(PROCESS_ALL_ACCESS, False, self.pid)
+            if not handle:
+                handle = kernel32.OpenProcess(PROCESS_RW_QUERY, False, self.pid)
+
+            if not handle:
+                err = kernel32.GetLastError()
+                self.log.err(f"OpenProcess falló para PID {self.pid} (Error Win32 {err}). Usa el botón 'Reiniciar como Admin'.")
+                self.pid = None
+                return False
+
+            self.process_handle = handle
+            self.log.ok(f"Conectado a {self.process_name} [PID: {self.pid}, Handle: 0x{handle:X}]")
+            if self.exe_full_path:
+                self.log.info(f"Ruta del ejecutable: {self.exe_full_path}")
+        else:
+            if not os.access(f"/proc/{self.pid}/mem", os.R_OK | os.W_OK):
+                self.log.err(f"Sin permisos sobre /proc/{self.pid}/mem. Ejecuta con sudo.")
+                self.pid = None
+                return False
+            self.log.ok(f"Conectado a {self.process_name} [PID: {self.pid}]")
+
+        self._last_auto_probe = now
+        self.verify_and_locate_player_struct(silent_if_menu=False)
+        return True
+
+    def detach(self):
+        if self.is_windows and self.process_handle:
+            try:
+                ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(self.process_handle))
+            except Exception:
+                pass
+        self.process_handle = None
+        self.pid = None
+        self.struct_verified = False
+        self._warned_title_screen = False
+
+    def is_attached(self):
+        return self.is_handle_alive()
+
+    def read_bytes(self, address, size):
+        if not self.is_attached():
+            return None
+        if self.is_windows:
+            buf = ctypes.create_string_buffer(size)
+            bytes_read = ctypes.c_size_t(0)
+            res = ctypes.windll.kernel32.ReadProcessMemory(
+                ctypes.c_void_p(self.process_handle),
+                ctypes.c_void_p(address),
+                buf,
+                ctypes.c_size_t(size),
+                ctypes.byref(bytes_read)
+            )
+            if res and bytes_read.value == size:
+                return buf.raw
+            self.last_error_code = ctypes.windll.kernel32.GetLastError()
+            return None
+        else:
+            try:
+                with open(f"/proc/{self.pid}/mem", "rb", buffering=0) as mem_f:
+                    mem_f.seek(address)
+                    return mem_f.read(size)
+            except Exception:
+                return None
+
+    def write_bytes(self, address, data, log_write=False):
+        if not self.is_attached():
+            return False
+        if self.is_windows:
+            size = len(data)
+            buf = ctypes.create_string_buffer(data, size)
+            bytes_written = ctypes.c_size_t(0)
+            old_protect = wintypes.DWORD(0)
+            PAGE_EXECUTE_READWRITE = 0x40
+            PAGE_READWRITE = 0x04
+
+            kernel32 = ctypes.windll.kernel32
+            res = kernel32.WriteProcessMemory(
+                ctypes.c_void_p(self.process_handle),
+                ctypes.c_void_p(address),
+                buf,
+                ctypes.c_size_t(size),
+                ctypes.byref(bytes_written)
+            )
+            if not res or bytes_written.value != size:
+                kernel32.VirtualProtectEx(
+                    ctypes.c_void_p(self.process_handle),
+                    ctypes.c_void_p(address),
+                    ctypes.c_size_t(size),
+                    PAGE_READWRITE,
+                    ctypes.byref(old_protect)
+                )
+                res = kernel32.WriteProcessMemory(
+                    ctypes.c_void_p(self.process_handle),
+                    ctypes.c_void_p(address),
+                    buf,
+                    ctypes.c_size_t(size),
+                    ctypes.byref(bytes_written)
+                )
+                if not res:
+                    kernel32.VirtualProtectEx(
+                        ctypes.c_void_p(self.process_handle),
+                        ctypes.c_void_p(address),
+                        ctypes.c_size_t(size),
+                        PAGE_EXECUTE_READWRITE,
+                        ctypes.byref(old_protect)
+                    )
+                    res = kernel32.WriteProcessMemory(
+                        ctypes.c_void_p(self.process_handle),
+                        ctypes.c_void_p(address),
+                        buf,
+                        ctypes.c_size_t(size),
+                        ctypes.byref(bytes_written)
+                    )
+            ok = bool(res and bytes_written.value == size)
+            if not ok:
+                self.last_error_code = kernel32.GetLastError()
+                if log_write:
+                    self.log.err(f"Fallo al escribir en 0x{address:X} (WinError {self.last_error_code})")
+            elif log_write:
+                self.log.ok(f"Escritos {size} bytes en 0x{address:X}")
+            return ok
+        else:
+            try:
+                with open(f"/proc/{self.pid}/mem", "r+b", buffering=0) as mem_f:
+                    mem_f.seek(address)
+                    mem_f.write(data)
+                if log_write:
+                    self.log.ok(f"Escritos {len(data)} bytes en 0x{address:X}")
+                return True
+            except Exception as e:
+                if log_write:
+                    self.log.err(f"Fallo al escribir en 0x{address:X}: {e}")
+                return False
+
+    def read_u32(self, address):
+        raw = self.read_bytes(address, 4)
+        if raw and len(raw) == 4:
+            return struct.unpack("<I", raw)[0]
+        return None
+
+    def write_u32(self, address, value, log_write=False):
+        return self.write_bytes(address, struct.pack("<I", int(value) & 0xFFFFFFFF), log_write=log_write)
+
+    def _check_struct_buffer(self, data, base_offset, known_rupees=None, known_hearts=None, known_arrows=None):
+        """
+        Verifica si `data[base_offset : base_offset + 0xC30]` contiene una
+        estructura válida de Link en OoT Switch 2 (con o sin trucos previos).
+        No exige que los 3 slots (+0x180, +0x184, +0x188) sean idénticos, sino que
+        al menos un par (cur_health, max_health) separado por 0x28 bytes sea válido
+        y que todos los contadores de munición y rupias estén dentro de rango.
+        Devuelve `(is_valid, score, slot_idx, ch_val, mh_val, rup_val, arr_val)`.
+        """
+        if base_offset < 0 or (base_offset + 0xC28) > len(data):
+            return False, 0, 1, 0, 0, 0, 0
+
+        rup_val = struct.unpack_from("<I", data, base_offset + 0x134)[0]
+        if rup_val > 9999:
+            return False, 0, 1, 0, 0, 0, 0
+        if known_rupees is not None and rup_val != known_rupees:
+            return False, 0, 1, 0, 0, 0, 0
+
+        arr_val  = struct.unpack_from("<I", data, base_offset + 0x814)[0]
+        bmb_val  = struct.unpack_from("<I", data, base_offset + 0x83C)[0]
+        chu_val  = struct.unpack_from("<I", data, base_offset + 0x8DC)[0]
+        nut_val  = struct.unpack_from("<I", data, base_offset + 0xA1C)[0]
+        seed_val = struct.unpack_from("<I", data, base_offset + 0xA44)[0]
+        stk_val  = struct.unpack_from("<I", data, base_offset + 0xA6C)[0]
+        bean_val = struct.unpack_from("<I", data, base_offset + 0xC24)[0]
+
+        # Todos los contadores de munición deben ser razonables (0..9999)
+        if any(v > 9999 for v in (arr_val, bmb_val, chu_val, nut_val, seed_val, stk_val, bean_val)):
+            return False, 0, 1, 0, 0, 0, 0
+        if known_arrows is not None and arr_val != known_arrows:
+            return False, 0, 1, 0, 0, 0, 0
+
+        target_mh = int(known_hearts * 4) if known_hearts else None
+
+        # Evaluar cualquiera de los 3 pares (cur_health, max_health) separados por 0x28 bytes
+        best_slot = 0
+        best_ch = 0
+        best_mh = 0
+        matched_pairs = 0
+
+        for idx, (c_off, m_off) in enumerate([(0x158, 0x180), (0x15C, 0x184), (0x160, 0x188)], start=1):
+            ch = struct.unpack_from("<I", data, base_offset + c_off)[0]
+            mh = struct.unpack_from("<I", data, base_offset + m_off)[0]
+            if 12 <= mh <= 80 and (mh % 4 == 0) and (0 < ch <= mh):
+                if target_mh is None or mh == target_mh:
+                    matched_pairs += 1
+                    if best_slot == 0:
+                        best_slot, best_ch, best_mh = idx, ch, mh
+
+        if best_slot == 0:
+            return False, 0, 1, 0, 0, 0, 0
+
+        # Evitar falsos positivos en bloques casi vacíos exigiendo que al menos un ítem/rupia sea > 0
+        # o que al menos 2 pares de salud coincidan o que el usuario haya filtrado un valor exacto
+        non_zero_items = sum(1 for v in (rup_val, arr_val, bmb_val, chu_val, nut_val, seed_val, stk_val) if 0 < v <= 999)
+        if non_zero_items == 0 and matched_pairs < 2 and known_hearts is None and known_rupees is None and known_arrows is None:
+            return False, 0, 1, 0, 0, 0, 0
+
+        score = (
+            matched_pairs * 100
+            + non_zero_items * 25
+            + (500 if known_hearts is not None and best_mh == target_mh else 0)
+            + (500 if known_arrows is not None and arr_val == known_arrows else 0)
+            + (500 if known_rupees is not None and rup_val == known_rupees else 0)
+        )
+        return True, score, best_slot, best_ch, best_mh, rup_val, arr_val
+
+    def _is_valid_player_struct(self, base_addr):
+        raw = self.read_bytes(base_addr, 0xC30)
+        if not raw or len(raw) < 0xC28:
+            return False
+        ok, _score, slot, _ch, _mh, _rup, _arr = self._check_struct_buffer(raw, 0)
+        if ok:
+            self.active_health_slot = slot
+        return ok
+
+    def verify_and_locate_player_struct(self, silent_if_menu=False):
+        """
+        1) Prueba los perfiles conocidos (`0x107F37C000`, `0x107C66C000`) y la dirección actual.
+        2) Si no coinciden, realiza un escaneo rápido de límites de página (`0x...000`)
+           sobre las regiones comprometidas del Heap (`0x1000000000+`).
+        3) Si el jugador aún está en la pantalla de título ("Continuar / Nueva partida"),
+           espera silenciosamente y vuelve a comprobar automáticamente cuando cargue la partida.
+        """
+        if not self.is_attached():
+            return False
+
+        # 1. Probar dirección actual y perfiles conocidos
+        candidates = [self.player_struct_addr] + [GUEST_HEAP_BASE + off for off in KNOWN_HEAP_OFFSETS]
+        for cand in candidates:
+            if self._is_valid_player_struct(cand):
+                self.player_struct_addr = cand
+                self.struct_verified = True
+                self._warned_title_screen = False
+                rup = self.read_u32(cand + STRUCT_OFFSETS["rupees"]) or 0
+                hp, mhp = self.read_active_health()
+                arr = self.read_u32(cand + STRUCT_OFFSETS["arrows"]) or 0
+                self.log.ok(
+                    f"¡Estructura de Link conectada en 0x{cand:X}! "
+                    f"(Corazones: {hp/4:.1f}/{mhp//4}, Flechas: {arr}, Rupias: {rup})"
+                )
+                return True
+
+        # 2. Escaneo rápido automático en páginas alineadas a 4 KB (0x...000) del Heap
+        if self.quick_page_scan_heap():
+            return True
+
+        self.struct_verified = False
+        if not silent_if_menu and not self._warned_title_screen:
+            self._warned_title_screen = True
+            self.log.info(
+                "Juego conectado. Si estás en la pantalla de título ('Continuar / Nueva partida'), "
+                "entra a tu partida y el Mod Menu detectará a Link automáticamente en 2 segundos."
+            )
+        return False
+
+    def enumerate_committed_rw_regions(self, include_all_address_space=False):
+        """
+        Devuelve una lista de tuplas `(base_addr, size)` de regiones RW comprometidas (`MEM_COMMIT`).
+        Por defecto inspecciona primero el Heap del invitado (`0x1000000000` .. `0x2000000000`),
+        y si `include_all_address_space=True` (o si el Heap en 0x1000000000 está vacío),
+        incluye todas las regiones RW comprometidas de >= 64 KB en todo el proceso.
+        """
+        heap_regions = []
+        other_regions = []
+        min_heap = GUEST_HEAP_BASE
+        max_heap = GUEST_HEAP_BASE + 0x1000000000  # 64 GB de ventana de Heap
+
+        if self.is_windows:
+            kernel32 = ctypes.windll.kernel32
+            kernel32.VirtualQueryEx.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.POINTER(MEMORY_BASIC_INFORMATION64), ctypes.c_size_t
+            ]
+            kernel32.VirtualQueryEx.restype = ctypes.c_size_t
+
+            mbi = MEMORY_BASIC_INFORMATION64()
+            curr = 0x10000 if include_all_address_space else min_heap
+            max_addr = 0x7FFFFFFFFFFF if include_all_address_space else max_heap
+            MEM_COMMIT = 0x1000
+            PAGE_NOACCESS = 0x01
+            PAGE_GUARD = 0x100
+            RW_MASK = 0x04 | 0x08 | 0x40 | 0x80  # PAGE_READWRITE, WRITECOPY, EXECUTE_READWRITE, EXECUTE_WRITECOPY
+
+            while curr < max_addr:
+                res = kernel32.VirtualQueryEx(
+                    ctypes.c_void_p(self.process_handle),
+                    ctypes.c_void_p(curr),
+                    ctypes.byref(mbi),
+                    ctypes.sizeof(mbi)
+                )
+                if not res or mbi.RegionSize == 0:
+                    break
+                if (
+                    mbi.State == MEM_COMMIT
+                    and not (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))
+                    and (mbi.Protect & RW_MASK)
+                    and mbi.RegionSize >= 0x10000
+                ):
+                    if min_heap <= mbi.BaseAddress < max_heap:
+                        heap_regions.append((mbi.BaseAddress, mbi.RegionSize))
+                    elif include_all_address_space:
+                        other_regions.append((mbi.BaseAddress, mbi.RegionSize))
+                next_addr = mbi.BaseAddress + mbi.RegionSize
+                if next_addr <= curr:
+                    break
+                curr = next_addr
+        else:
+            try:
+                with open(f"/proc/{self.pid}/maps", "r", encoding="utf-8") as f:
+                    for line in f:
+                        parts = line.split()
+                        if len(parts) >= 2 and "rw" in parts[1]:
+                            start_s, end_s = parts[0].split("-")
+                            start_a, end_a = int(start_s, 16), int(end_s, 16)
+                            size = end_a - start_a
+                            if size >= 0x10000:
+                                if min_heap <= start_a < max_heap:
+                                    heap_regions.append((start_a, size))
+                                elif include_all_address_space:
+                                    other_regions.append((start_a, size))
+            except Exception:
+                pass
+
+        return heap_regions + other_regions
+
+    def quick_page_scan_heap(self):
+        """
+        Escaneo ultrarrápido (< 80 ms) que revisa todos los inicios de página (0x...000)
+        dentro del Heap comprometido (`0x1000000000+`), ya que la estructura de Link
+        en OoT Switch 2 suele alojarse alineada a 4 KB (ej. 0x107F37C000, 0x107C66C000).
+        """
+        regions = self.enumerate_committed_rw_regions(include_all_address_space=False)
+        if not regions:
+            return False
+
+        chunk_size = 4 * 1024 * 1024
+        best_candidate = None
+        best_score = -1
+
+        for reg_base, reg_size in regions:
+            offset = 0
+            while offset < reg_size:
+                read_len = min(chunk_size, reg_size - offset)
+                addr = reg_base + offset
+                data = self.read_bytes(addr, read_len)
+                if data and len(data) >= 0x1000:
+                    # Revisar cada límite de página de 4 KB (0x1000)
+                    max_page_off = len(data) - 0xC30
+                    for page_off in range(0, max_page_off + 1, 0x1000):
+                        ok, score, slot, ch, mh, rup, arr = self._check_struct_buffer(data, page_off)
+                        if ok and score > best_score:
+                            best_score = score
+                            best_candidate = (addr + page_off, slot, ch, mh, rup, arr)
+                offset += read_len
+
+        if best_candidate:
+            found_base, slot, ch, mh, rup, arr = best_candidate
+            self.player_struct_addr = found_base
+            self.active_health_slot = slot
+            self.struct_verified = True
+            self._warned_title_screen = False
+            self.log.ok(
+                f"¡Auto-detectada estructura de Link en 0x{found_base:X}! "
+                f"(Corazones: {ch/4:.1f}/{mh//4}, Flechas: {arr}, Rupias: {rup})"
+            )
+            return True
+        return False
+
+    def scan_player_struct(self, known_rupees=None, known_hearts=None, known_arrows=None):
+        """
+        Escaneo profundo en dos etapas:
+          - Etapa 1: Escanea todas las regiones del Heap (`0x1000000000+`) y luego
+            el resto de la memoria RW del proceso en límites de página (`0x1000`).
+          - Etapa 2: Escanea cada alineación de 4 bytes buscando cualquier par
+            `(cur_health, max_health)` separado por `0x28` bytes que cumpla la firma
+            completa de inventario (Rupias, Flechas, Bombas, Nueces/Palos/Semillas Deku).
+        """
+        if not self.attach():
+            self.log.err("No hay proceso de Hookshot conectado para escanear.")
+            return False
+
+        regions = self.enumerate_committed_rw_regions(include_all_address_space=True)
+        total_mb = sum(s for _, s in regions) / (1024 * 1024)
+        filters_desc = []
+        if known_hearts is not None: filters_desc.append(f"Corazones={known_hearts}")
+        if known_arrows is not None: filters_desc.append(f"Flechas={known_arrows}")
+        if known_rupees is not None: filters_desc.append(f"Rupias={known_rupees}")
+        f_txt = ", ".join(filters_desc) if filters_desc else "Automático (3 a 20 corazones)"
+        self.log.info(f"Escaneando {len(regions)} regiones RW ({total_mb:.1f} MB) | Filtro: {f_txt}...")
+
+        target_mh = int(known_hearts * 4) if known_hearts else None
+        hearts_candidates = [target_mh] if target_mh else [
+            72, 80, 76, 68, 64, 60, 56, 52, 48, 44, 40, 36, 32, 28, 24, 20, 16, 12
+        ]
+
+        chunk_size = 4 * 1024 * 1024
+        best_match = None
+        best_score = -1
+
+        for reg_base, reg_size in regions:
+            offset = 0
+            while offset < reg_size:
+                read_len = min(chunk_size, reg_size - offset)
+                addr = reg_base + offset
+                data = self.read_bytes(addr, read_len)
+                if data and len(data) >= 0xC30:
+                    # Paso A: Revisar todas las páginas alineadas a 4 KB (0x1000) en este bloque
+                    max_base = len(data) - 0xC30
+                    for page_off in range(0, max_base + 1, 0x1000):
+                        ok, score, slot, ch, mh, rup, arr = self._check_struct_buffer(
+                            data, page_off, known_rupees, known_hearts, known_arrows
+                        )
+                        if ok:
+                            # Bonificación alta por estar alineado a página de 4 KB y dentro del Heap 0x1000000000+
+                            aligned_score = score + 300 + (200 if reg_base >= GUEST_HEAP_BASE else 0)
+                            if aligned_score > best_score:
+                                best_score = aligned_score
+                                best_match = (addr + page_off, slot, ch, mh, rup, arr)
+
+                    # Paso B: Búsqueda por ocurrencia de max_health en cualquier alineación de 4 bytes
+                    for mh_val in hearts_candidates:
+                        pat = struct.pack("<I", mh_val)
+                        pos = data.find(pat)
+                        while pos != -1:
+                            if (pos & 3) == 0:
+                                for slot_idx, m_off in ((1, 0x180), (2, 0x184), (3, 0x188)):
+                                    base_off = pos - m_off
+                                    if 0 <= base_off <= max_base:
+                                        ok, score, slot, ch, mh, rup, arr = self._check_struct_buffer(
+                                            data, base_off, known_rupees, known_hearts, known_arrows
+                                        )
+                                        if ok:
+                                            if ((addr + base_off) & 0xFFF) == 0:
+                                                score += 300
+                                            if reg_base >= GUEST_HEAP_BASE:
+                                                score += 200
+                                            if score > best_score:
+                                                best_score = score
+                                                best_match = (addr + base_off, slot, ch, mh, rup, arr)
+                            pos = data.find(pat, pos + 4)
+                offset += read_len
+
+        if best_match:
+            found_base, slot, ch, mh, rup, arr = best_match
+            self.player_struct_addr = found_base
+            self.active_health_slot = slot
+            self.struct_verified = True
+            self._warned_title_screen = False
+            self.log.ok(
+                f"¡Estructura de Link encontrada en 0x{found_base:X} (Slot #{slot})! "
+                f"Corazones: {ch/4:.1f}/{mh//4} | Flechas: {arr} | Rupias: {rup}"
+            )
+            return True
+
+        self.log.warn(
+            "No se encontró la estructura de Link todavía. Asegúrate de haber cargado tu partida "
+            "(no estar en la pantalla de título 'Continuar / Nueva partida') y deja los filtros en blanco o pon tus corazones/flechas actuales."
+        )
+        return False
+
+    def read_active_health(self):
+        """Lee (cur_health, max_health) del slot válido activo (+0x158/+0x180, +0x15C/+0x184 o +0x160/+0x188)."""
+        base = self.player_struct_addr
+        slot_map = {
+            1: (0x158, 0x180),
+            2: (0x15C, 0x184),
+            3: (0x160, 0x188),
+        }
+        # Probar primero el slot activo; si da 0, revisar los otros dos
+        order = [self.active_health_slot] + [s for s in (1, 2, 3) if s != self.active_health_slot]
+        for s in order:
+            c_off, m_off = slot_map[s]
+            ch = self.read_u32(base + c_off)
+            mh = self.read_u32(base + m_off)
+            if ch is not None and mh is not None and (12 <= mh <= 80) and (mh % 4 == 0):
+                self.active_health_slot = s
+                return ch, mh
+        ch = self.read_u32(base + 0x158) or 0
+        mh = self.read_u32(base + 0x180) or 0
+        return ch, mh
+
+    def get_field_addr(self, field_name):
+        return self.player_struct_addr + STRUCT_OFFSETS[field_name]
+
+
+# =============================================================================
+# PUENTE DE CONTROL OFICIAL DE HOOKSHOT (scripts/hookshot_ctl.py + HOS_CONTROL)
+# =============================================================================
+class HookshotLiveBridge:
+    def __init__(self, logger: LiveLogger, game_dir=""):
+        self.log = logger
+        self.game_dir = game_dir
+        self.socket_path = ""
+        self.live_file_path = ""
+        self._update_paths()
+
+    def set_game_dir(self, path):
+        self.game_dir = path
+        self._update_paths()
+
+    def _update_paths(self):
+        if self.game_dir and os.path.isdir(self.game_dir):
+            self.live_file_path = os.path.join(self.game_dir, "hookshot_live_input.txt")
+            if sys.platform.startswith("win"):
+                self.socket_path = r"\\.\pipe\hookshot_control"
+            else:
+                self.socket_path = os.path.join(self.game_dir, "hookshot_control.sock")
+        else:
+            self.live_file_path = os.path.abspath("hookshot_live_input.txt")
+            self.socket_path = "/tmp/hookshot_control.sock"
+
+    def configure_game_environment(self):
+        """
+        Configura `hookshot_env.txt` y `hookshot_options.ini` en la carpeta del
+        juego para garantizar que `HOS_OOT_CHEATS=1` y `debug_tools=1` estén
+        activados (lo cual habilita la pestaña Debug, Heart Protection, No-clip,
+        Teleport y Switch Age en el propio motor de Hookshot).
+        """
+        if not self.game_dir or not os.path.isdir(self.game_dir):
+            self.log.warn("Carpeta del juego no válida al intentar configurar hookshot_env.txt.")
+            return False, "Selecciona primero la carpeta donde está instalado Hookshot."
+
+        env_path = os.path.join(self.game_dir, "hookshot_env.txt")
+        lines = []
+        if os.path.exists(env_path):
+            try:
+                with open(env_path, "r", encoding="utf-8") as f:
+                    lines = f.read().splitlines()
+            except Exception:
+                lines = []
+
+        filtered = [l for l in lines if not l.strip().startswith(("HOS_OOT_CHEATS=", "HOS_INPUT_BACKGROUND="))]
+        filtered.append("HOS_OOT_CHEATS=1")
+        filtered.append("HOS_INPUT_BACKGROUND=1")
+
+        try:
+            with open(env_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(filtered) + "\n")
+            self.log.ok(f"Activado HOS_OOT_CHEATS=1 en {env_path}")
+        except Exception as e:
+            self.log.err(f"Error escribiendo {env_path}: {e}")
+            return False, str(e)
+
+        ini_path = os.path.join(self.game_dir, "hookshot_options.ini")
+        if os.path.exists(ini_path):
+            try:
+                with open(ini_path, "r", encoding="utf-8") as f:
+                    ini_lines = f.read().splitlines()
+                new_ini = [l for l in ini_lines if not l.strip().startswith("debug_tools=")]
+                new_ini.append("debug_tools=1")
+                with open(ini_path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(new_ini) + "\n")
+                self.log.ok(f"Activado debug_tools=1 en {ini_path}")
+            except Exception as e:
+                self.log.warn(f"No se pudo actualizar hookshot_options.ini: {e}")
+
+        return True, "HOS_OOT_CHEATS=1 y debug_tools=1 activados correctamente."
+
+    def send_bridge_command(self, payload):
+        msg_str = json.dumps(payload) + "\n"
+
+        if sys.platform.startswith("win") and os.path.exists(self.socket_path):
+            try:
+                with open(self.socket_path, "r+b", buffering=0) as pipe:
+                    pipe.write(msg_str.encode("utf-8"))
+                    reply = pipe.readline().decode("utf-8", errors="ignore").strip()
+                self.log.ok(f"Respuesta HOS_CONTROL (Pipe): {reply}")
+                return True, reply
+            except Exception as e:
+                self.log.warn(f"Fallo en Named Pipe {self.socket_path}: {e}")
+
+        if not sys.platform.startswith("win") and os.path.exists(self.socket_path):
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                    s.settimeout(1.5)
+                    s.connect(self.socket_path)
+                    s.sendall(msg_str.encode("utf-8"))
+                    reply = s.recv(4096).decode("utf-8", errors="ignore").strip()
+                self.log.ok(f"Respuesta HOS_CONTROL (Socket): {reply}")
+                return True, reply
+            except Exception as e:
+                self.log.warn(f"Fallo en Socket {self.socket_path}: {e}")
+
+        if self.game_dir:
+            for script_name in ("hookshot_ctl.py", "longshot_ctl.py"):
+                ctl_script = os.path.join(self.game_dir, "scripts", script_name)
+                if os.path.isfile(ctl_script):
+                    try:
+                        cmd_args = [sys.executable, "-I", ctl_script]
+                        if payload.get("cmd") == "teleport":
+                            cmd_args += ["teleport", str(payload.get("index", 0))]
+                            if "age" in payload:
+                                cmd_args += ["--age", str(payload["age"])]
+                        elif payload.get("cmd") == "age":
+                            cmd_args += ["age", str(payload.get("age", "child"))]
+                        elif payload.get("cmd") == "option_set":
+                            cmd_args += ["option_set", str(payload.get("option", "")), str(payload.get("value", ""))]
+
+                        env = os.environ.copy()
+                        env["HOS_CONTROL"] = self.socket_path
+                        out = subprocess.check_output(cmd_args, stderr=subprocess.STDOUT, text=True, timeout=2.5, env=env)
+                        self.log.ok(f"Ejecutado {script_name}: {out.strip()}")
+                        return True, out.strip()
+                    except Exception as e:
+                        self.log.warn(f"Error ejecutando {script_name}: {e}")
+
+        return False, "Socket HOS_CONTROL no activo (inicia el juego desde el botón 'Iniciar Juego Conectado')."
+
+    def append_live_command(self, line):
+        try:
+            with open(self.live_file_path, "a", encoding="utf-8") as f:
+                f.write(line.strip() + "\n")
+            self.log.info(f"HOS_INPUT_LIVE -> {line.strip()}")
+            return True
+        except Exception as e:
+            self.log.err(f"No se pudo escribir en HOS_INPUT_LIVE ({self.live_file_path}): {e}")
+            return False
+
+    def teleport(self, dest_entry, age_mode="keep"):
+        payload = {
+            "cmd": "teleport",
+            "index": dest_entry["idx"],
+            "destination": dest_entry["id"],
+            "map": dest_entry["map"],
+            "spawn": dest_entry["spawn"],
+        }
+        if age_mode in ("child", "adult"):
+            payload["age"] = age_mode
+
+        ok, reply = self.send_bridge_command(payload)
+        if age_mode in ("child", "adult"):
+            self.append_live_command(f"!age {age_mode}")
+            time.sleep(0.035)
+        self.append_live_command(f"!teleport {dest_entry['map']} {dest_entry['spawn']}")
+
+        if ok:
+            return True, f"Teletransportado a {dest_entry['name']} ({reply or 'OK'})"
+        return True, f"Orden enviada a {dest_entry['name']} vía HOS_INPUT_LIVE."
+
+
+# =============================================================================
+# CONTROLADOR PRINCIPAL DE TRUCOS Y TELEMETRÍA EN VIVO (20 Hz SIN BLOQUEOS)
+# =============================================================================
+class ModMenuController:
+    def __init__(self, logger: LiveLogger):
+        self.log = logger
+        self.mem = ExternalProcessMemory(logger)
+        self.bridge = HookshotLiveBridge(logger)
+
+        self.inf_health = False
+        self.inf_magic = False
+        self.god_mode = False
+        self.damage_mult = 1.0
+        self.moon_jump = False
+        self.no_clip = False
+        self.inf_rupees_ammo = False
+
+        self.live_cur_hp = 0
+        self.live_max_hp = 0
+        self.live_magic = 0
+        self.live_rupees = 0
+        self.live_arrows = 0
+        self.live_bombs = 0
+        self.write_cycles = 0
+
+        self.running = True
+        self.worker_thread = threading.Thread(target=self._realtime_loop, daemon=True)
+        self.worker_thread.start()
+
+    def _realtime_loop(self):
+        """Bucle ligero de 20 Hz que lee la telemetría de Link y congela los trucos activos."""
+        while self.running:
+            if self.mem.attach() and self.mem.struct_verified:
+                try:
+                    chp, mhp = self.mem.read_active_health()
+                    mag = self.mem.read_u32(self.mem.get_field_addr("cur_magic"))
+                    rup = self.mem.read_u32(self.mem.get_field_addr("rupees"))
+                    arr = self.mem.read_u32(self.mem.get_field_addr("arrows"))
+                    bmb = self.mem.read_u32(self.mem.get_field_addr("bombs"))
+
+                    # Si la lectura de salud máxima dejó de ser válida (ej. cambio de edad Niño <-> Adulto),
+                    # marcar como no verificada para que el auto-buscador la relocalice en el siguiente ciclo
+                    if not (12 <= mhp <= 80) or (mhp % 4 != 0):
+                        self.mem.struct_verified = False
+                        time.sleep(0.1)
+                        continue
+
+                    self.live_cur_hp = chp
+                    self.live_max_hp = mhp
+                    if mag is not None and mag <= 0xFF: self.live_magic = mag
+                    if rup is not None and rup <= 99999: self.live_rupees = rup
+                    if arr is not None and arr <= 9999: self.live_arrows = arr
+                    if bmb is not None and bmb <= 9999: self.live_bombs = bmb
+
+                    any_written = False
+
+                    # 1. VIDA INFINITA (20 Corazones = 0x50)
+                    if self.inf_health:
+                        target_hp = 0x50
+                        for f in ("max_health_1", "max_health_2", "max_health_3",
+                                  "cur_health_1", "cur_health_2", "cur_health_3"):
+                            if self.mem.write_u32(self.mem.get_field_addr(f), target_hp):
+                                any_written = True
+
+                    # 2. MAGIA INFINITA (Barra doble = 0x60)
+                    if self.inf_magic:
+                        self.mem.write_u32(self.mem.get_field_addr("magic_flag"), 2)
+                        self.mem.write_u32(self.mem.get_field_addr("max_magic"), 0x60)
+                        if self.mem.write_u32(self.mem.get_field_addr("cur_magic"), 0x60):
+                            any_written = True
+
+                    # 3. MODO DIOS / SIN DAÑO (Mantiene cur_health = max_health en los 3 slots)
+                    if self.god_mode:
+                        safe_hp = self.live_max_hp if (0x0C <= self.live_max_hp <= 0x50) else 0x50
+                        for f in ("cur_health_1", "cur_health_2", "cur_health_3"):
+                            if self.mem.write_u32(self.mem.get_field_addr(f), safe_hp):
+                                any_written = True
+
+                    # 4. EXTRA 2: RUPIAS Y MUNICIÓN INFINITA
+                    if self.inf_rupees_ammo:
+                        if self.mem.write_u32(self.mem.get_field_addr("rupees"), 9999):
+                            any_written = True
+                        self.mem.write_u32(self.mem.get_field_addr("arrows"), 99)
+                        self.mem.write_u32(self.mem.get_field_addr("bombs"), 99)
+                        self.mem.write_u32(self.mem.get_field_addr("bombchus"), 99)
+                        self.mem.write_u32(self.mem.get_field_addr("deku_nuts"), 99)
+                        self.mem.write_u32(self.mem.get_field_addr("deku_sticks"), 99)
+                        self.mem.write_u32(self.mem.get_field_addr("deku_seeds"), 99)
+                        self.mem.write_u32(self.mem.get_field_addr("magic_beans"), 99)
+
+                    if any_written:
+                        self.write_cycles += 1
+
+                except Exception as e:
+                    self.log.err(f"Excepción en bucle de tiempo real: {e}")
+            time.sleep(0.05)
+
+    def set_option_via_bridge(self, opt_name, val):
+        self.bridge.send_bridge_command({"cmd": "option_set", "option": opt_name, "value": val})
+
+    def unlock_all_items_live(self):
+        """Envía los 85 comandos `!cheat <n>` con la pausa de 32 ms requerida por `host/nn_hid.c`."""
+        def _worker():
+            self.log.info("Desbloqueando los 85 objetos del inventario vía HOS_INPUT_LIVE (32 ms por ítem)...")
+            for i in range(85):
+                self.bridge.append_live_command(f"!cheat {i}")
+                time.sleep(0.035)
+            self.log.ok("¡Se completó el envío de los 85 objetos del inventario!")
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def launch_game_with_bridge(self, game_dir):
+        """
+        Inicia directamente `bin/hookshot.exe` (o `bin/hookshot`) con las variables
+        `HOS_CONTROL`, `HOS_INPUT_LIVE` y `HOS_OOT_CHEATS=1` inyectadas en el entorno.
+        """
+        if not game_dir or not os.path.isdir(game_dir):
+            return False, "Selecciona primero la carpeta donde instalaste Hookshot."
+
+        self.bridge.set_game_dir(game_dir)
+        self.bridge.configure_game_environment()
+
+        exe_candidates = [
+            os.path.join(game_dir, "bin", "hookshot.exe"),
+            os.path.join(game_dir, "bin", "longshot.exe"),
+            os.path.join(game_dir, "bin", "hookshot"),
+            os.path.join(game_dir, "bin", "longshot"),
+            os.path.join(game_dir, "hookshot.exe"),
+            os.path.join(game_dir, "hookshot"),
+        ]
+        exe_path = next((p for p in exe_candidates if os.path.isfile(p)), None)
+        if not exe_path:
+            self.log.err(f"No se encontró bin/hookshot.exe dentro de {game_dir}")
+            return False, f"No se encontró bin/hookshot.exe dentro de:\n{game_dir}"
+
+        env = os.environ.copy()
+        env["HOS_OOT_CHEATS"] = "1"
+        env["HOS_CONTROL"] = self.bridge.socket_path
+        env["HOS_INPUT_LIVE"] = self.bridge.live_file_path
+        env["HOS_INPUT_BACKGROUND"] = "1"
+
+        try:
+            open(self.bridge.live_file_path, "w", encoding="utf-8").close()
+        except Exception:
+            pass
+
+        try:
+            self.log.info(f"Lanzando juego directo: {exe_path}")
+            self.log.info(f"  -> HOS_CONTROL={self.bridge.socket_path}")
+            self.log.info(f"  -> HOS_INPUT_LIVE={self.bridge.live_file_path}")
+            subprocess.Popen([exe_path], cwd=game_dir, env=env)
+            return True, f"Juego iniciado directamente con puente en vivo:\n{exe_path}"
+        except Exception as e:
+            self.log.err(f"Error al iniciar {exe_path}: {e}")
+            return False, f"Error al iniciar el ejecutable: {e}"
+
+
+# =============================================================================
+# COMPONENTES MODERNOS DE INTERFAZ GRÁFICA (CUSTOM CANVAS SWITCHES & CARDS)
+# =============================================================================
+class ModernToggleSwitch(tk.Canvas):
+    """Interruptor animado estilo iOS / Gaming Overlay moderno."""
+    def __init__(self, parent, variable: tk.BooleanVar, command=None, bg_color="#151b26"):
+        super().__init__(parent, width=52, height=26, bg=bg_color, highlightthickness=0, bd=0, cursor="hand2")
+        self.variable = variable
+        self.command = command
+        self.bind("<Button-1>", self._toggle)
+        self.variable.trace_add("write", lambda *_: self._draw())
+        self._draw()
+
+    def _toggle(self, _event=None):
+        self.variable.set(not self.variable.get())
+        if self.command:
+            self.command()
+
+    def _draw(self):
+        self.delete("all")
+        on = self.variable.get()
+        track_color = "#10b981" if on else "#2d3748"
+        knob_color = "#ffffff" if on else "#94a3b8"
+
+        self.create_oval(2, 2, 24, 24, fill=track_color, outline="")
+        self.create_oval(28, 2, 50, 24, fill=track_color, outline="")
+        self.create_rectangle(13, 2, 39, 24, fill=track_color, outline="")
+
+        kx = 28 if on else 4
+        self.create_oval(kx, 4, kx + 18, 22, fill=knob_color, outline="")
+
+
+class HookshotModernGUI:
+    BG_MAIN      = "#0b0f17"
+    BG_SIDEBAR   = "#101622"
+    BG_CARD      = "#151c28"
+    BG_CARD_ALT  = "#1c2536"
+    ACCENT_GOLD  = "#f59e0b"
+    ACCENT_CYAN  = "#06b6d4"
+    ACCENT_GREEN = "#10b981"
+    ACCENT_RED   = "#ef4444"
+    TEXT_PRIMARY = "#f8fafc"
+    TEXT_MUTED   = "#94a3b8"
+    BORDER_COLOR = "#263147"
+
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.logger = LiveLogger()
+        self.ctrl = ModMenuController(self.logger)
+
+        self.root.title("Hookshot v2.2.0-rc.1 — Triforce Engine Overlay & Live Trainer v3.0")
+        self.root.geometry("1000x730")
+        self.root.minsize(920, 650)
+        self.root.configure(bg=self.BG_MAIN)
+
+        self.var_topmost = tk.BooleanVar(value=True)
+        self.root.attributes("-topmost", True)
+
+        self.var_game_dir = tk.StringVar(value=self._guess_default_game_dir())
+        self.ctrl.bridge.set_game_dir(self.var_game_dir.get())
+
+        self.var_inf_health = tk.BooleanVar(value=False)
+        self.var_inf_magic  = tk.BooleanVar(value=False)
+        self.var_god_mode   = tk.BooleanVar(value=False)
+        self.var_moon_jump  = tk.BooleanVar(value=False)
+        self.var_no_clip    = tk.BooleanVar(value=False)
+        self.var_inf_rupees = tk.BooleanVar(value=False)
+        self.var_dmg_mult   = tk.DoubleVar(value=1.0)
+        self.var_age_select = tk.StringVar(value="keep")
+
+        # Variables para el escáner dinámico (vacío = Auto-Detectar cualquier corazón de 3 a 20)
+        self.var_scan_hearts = tk.StringVar(value="")
+        self.var_scan_arrows = tk.StringVar(value="")
+        self.var_scan_rupees = tk.StringVar(value="")
+        self.var_custom_addr = tk.StringVar(value=f"0x{self.ctrl.mem.player_struct_addr:X}")
+
+        # Variables de telemetría en vivo
+        self.var_tele_pid    = tk.StringVar(value="ESPERANDO...")
+        self.var_tele_hp     = tk.StringVar(value="-- / --")
+        self.var_tele_magic  = tk.StringVar(value="--")
+        self.var_tele_rupees = tk.StringVar(value="--")
+        self.var_tele_cycles = tk.StringVar(value="0")
+
+        self._configure_ttk_styles()
+        self._build_layout()
+        self._bind_hotkeys()
+
+        self.logger.add_listener(self._on_new_log_line)
+        self.logger.info("Triforce Engine v3.0 iniciado. Listo para conectar con Hookshot v2.2.0-rc.1.")
+        if sys.platform.startswith("win"):
+            try:
+                is_admin = bool(ctypes.windll.shell32.IsUserAnAdmin())
+                if is_admin:
+                    self.logger.ok("Ejecutando con permisos de Administrador en Windows.")
+                else:
+                    self.logger.warn("No estás en modo Administrador. Puedes pulsar '🛡️ Reiniciar como Admin' abajo a la izquierda.")
+            except Exception:
+                pass
+
+        self._ui_refresh_loop()
+
+    def _guess_default_game_dir(self):
+        home = os.path.expanduser("~")
+        candidates = [
+            os.path.join(home, "Games", "Hookshot"),
+            os.path.join(home, "Games", "Longshot"),
+            r"C:\Games\Hookshot",
+            r"C:\Games\Longshot",
+        ]
+        for c in candidates:
+            if os.path.isdir(c):
+                return c
+        return candidates[0]
+
+    def _configure_ttk_styles(self):
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure(
+            "Modern.Treeview",
+            background=self.BG_CARD,
+            foreground=self.TEXT_PRIMARY,
+            fieldbackground=self.BG_CARD,
+            borderwidth=0,
+            rowheight=30,
+            font=("Segoe UI", 10)
+        )
+        style.configure(
+            "Modern.Treeview.Heading",
+            background=self.BG_SIDEBAR,
+            foreground=self.ACCENT_GOLD,
+            borderwidth=0,
+            font=("Segoe UI", 10, "bold"),
+            padding=6
+        )
+        style.map(
+            "Modern.Treeview",
+            background=[("selected", "#1d4ed8")],
+            foreground=[("selected", "#ffffff")]
+        )
+
+    def _build_layout(self):
+        top_bar = tk.Frame(self.root, bg=self.BG_SIDEBAR, height=74, highlightthickness=1, highlightbackground=self.BORDER_COLOR)
+        top_bar.pack(fill="x", side="top")
+        top_bar.pack_propagate(False)
+
+        title_box = tk.Frame(top_bar, bg=self.BG_SIDEBAR)
+        title_box.pack(side="left", padx=18, pady=10)
+        tk.Label(
+            title_box, text="▲ HOOKSHOT v2.2.0-rc.1", bg=self.BG_SIDEBAR,
+            fg=self.ACCENT_GOLD, font=("Segoe UI", 15, "bold")
+        ).pack(anchor="w")
+        tk.Label(
+            title_box, text="EXTERNAL MEMORY TRAINER & LIVE CONTROL BRIDGE (v3.0)",
+            bg=self.BG_SIDEBAR, fg=self.TEXT_MUTED, font=("Segoe UI", 8, "bold")
+        ).pack(anchor="w")
+
+        metrics_frame = tk.Frame(top_bar, bg=self.BG_SIDEBAR)
+        metrics_frame.pack(side="right", padx=16, pady=10)
+
+        self.badge_pid = self._create_metric_pill(metrics_frame, "ESTADO / PROCESO", self.var_tele_pid, self.ACCENT_GOLD)
+        self._create_metric_pill(metrics_frame, "CORAZONES (HP)", self.var_tele_hp, "#f43f5e")
+        self._create_metric_pill(metrics_frame, "MAGIA", self.var_tele_magic, self.ACCENT_GREEN)
+        self._create_metric_pill(metrics_frame, "RUPIAS", self.var_tele_rupees, self.ACCENT_CYAN)
+        self._create_metric_pill(metrics_frame, "CICLOS I/O", self.var_tele_cycles, "#a855f7")
+
+        body = tk.Frame(self.root, bg=self.BG_MAIN)
+        body.pack(fill="both", expand=True)
+
+        sidebar = tk.Frame(body, bg=self.BG_SIDEBAR, width=230, highlightthickness=1, highlightbackground=self.BORDER_COLOR)
+        sidebar.pack(fill="y", side="left")
+        sidebar.pack_propagate(False)
+
+        tk.Label(
+            sidebar, text="MÓDULOS ACTIVOS", bg=self.BG_SIDEBAR,
+            fg=self.TEXT_MUTED, font=("Segoe UI", 8, "bold")
+        ).pack(anchor="w", padx=18, pady=(16, 6))
+
+        self.nav_buttons = {}
+        self.pages = {}
+        self.page_container = tk.Frame(body, bg=self.BG_MAIN)
+        self.page_container.pack(fill="both", expand=True, side="left", padx=16, pady=14)
+
+        nav_items = [
+            ("combat",   "⚔️  Combate y Jugador"),
+            ("teleport", "🌀  Teletransporte (36)"),
+            ("scanner",  "🔍  Escáner y Memoria"),
+            ("extras",   "🎒  Inventario y Extras"),
+            ("logs",     "📟  Consola de Logs"),
+        ]
+        for key, label in nav_items:
+            btn = tk.Button(
+                sidebar, text=label, anchor="w", padx=18, pady=11,
+                bg=self.BG_SIDEBAR, fg=self.TEXT_PRIMARY, activebackground=self.BG_CARD_ALT,
+                activeforeground=self.ACCENT_GOLD, bd=0, relief="flat",
+                font=("Segoe UI", 10, "bold"), cursor="hand2",
+                command=lambda k=key: self._switch_page(k)
+            )
+            btn.pack(fill="x", padx=8, pady=2)
+            self.nav_buttons[key] = btn
+            page = tk.Frame(self.page_container, bg=self.BG_MAIN)
+            self.pages[key] = page
+
+        side_bottom = tk.Frame(sidebar, bg=self.BG_SIDEBAR)
+        side_bottom.pack(side="bottom", fill="x", padx=12, pady=12)
+
+        btn_launch = tk.Button(
+            side_bottom, text="▶ INICIAR JUEGO CONECTADO", bg=self.ACCENT_GREEN, fg="#052e16",
+            activebackground="#34d399", font=("Segoe UI", 9, "bold"), bd=0, pady=8, cursor="hand2",
+            command=self._action_launch_game
+        )
+        btn_launch.pack(fill="x", pady=(0, 6))
+
+        btn_scan_now = tk.Button(
+            side_bottom, text="⚡ AUTO-ESCANEAR MEMORIA", bg=self.ACCENT_GOLD, fg="#1e1b4b",
+            activebackground="#fbbf24", font=("Segoe UI", 9, "bold"), bd=0, pady=8, cursor="hand2",
+            command=self._action_auto_scan
+        )
+        btn_scan_now.pack(fill="x", pady=(0, 6))
+
+        if sys.platform.startswith("win"):
+            btn_admin = tk.Button(
+                side_bottom, text="🛡️ REINICIAR COMO ADMIN", bg="#1e293b", fg=self.ACCENT_CYAN,
+                activebackground="#334155", font=("Segoe UI", 8, "bold"), bd=0, pady=6, cursor="hand2",
+                command=self._action_relaunch_admin
+            )
+            btn_admin.pack(fill="x", pady=(0, 6))
+
+        chk_top = tk.Checkbutton(
+            side_bottom, text="Overlay Siempre Visible", variable=self.var_topmost,
+            command=lambda: self.root.attributes("-topmost", self.var_topmost.get()),
+            bg=self.BG_SIDEBAR, fg=self.TEXT_MUTED, selectcolor=self.BG_MAIN,
+            activebackground=self.BG_SIDEBAR, activeforeground=self.TEXT_PRIMARY,
+            font=("Segoe UI", 9)
+        )
+        chk_top.pack(anchor="w")
+
+        self._build_page_combat(self.pages["combat"])
+        self._build_page_teleport(self.pages["teleport"])
+        self._build_page_scanner(self.pages["scanner"])
+        self._build_page_extras(self.pages["extras"])
+        self._build_page_logs(self.pages["logs"])
+
+        self._switch_page("combat")
+
+    def _create_metric_pill(self, parent, title, var, color):
+        pill = tk.Frame(parent, bg=self.BG_CARD, padx=12, pady=5, highlightthickness=1, highlightbackground=self.BORDER_COLOR)
+        pill.pack(side="left", padx=4)
+        tk.Label(pill, text=title, bg=self.BG_CARD, fg=self.TEXT_MUTED, font=("Segoe UI", 7, "bold")).pack(anchor="w")
+        lbl = tk.Label(pill, textvariable=var, bg=self.BG_CARD, fg=color, font=("Consolas", 10, "bold"))
+        lbl.pack(anchor="w")
+        return lbl
+
+    def _switch_page(self, key):
+        for k, page in self.pages.items():
+            page.pack_forget()
+            self.nav_buttons[k].configure(bg=self.BG_SIDEBAR, fg=self.TEXT_PRIMARY)
+        self.pages[key].pack(fill="both", expand=True)
+        self.nav_buttons[key].configure(bg=self.BG_CARD_ALT, fg=self.ACCENT_GOLD)
+
+    def _create_toggle_card(self, parent, title, subtitle, variable, hotkey_hint, command):
+        card = tk.Frame(parent, bg=self.BG_CARD, padx=16, pady=11, highlightthickness=1, highlightbackground=self.BORDER_COLOR)
+        card.pack(fill="x", pady=4)
+
+        left = tk.Frame(card, bg=self.BG_CARD)
+        left.pack(side="left", fill="x", expand=True)
+
+        title_row = tk.Frame(left, bg=self.BG_CARD)
+        title_row.pack(anchor="w")
+        tk.Label(title_row, text=title, bg=self.BG_CARD, fg=self.TEXT_PRIMARY, font=("Segoe UI", 11, "bold")).pack(side="left")
+        if hotkey_hint:
+            tk.Label(
+                title_row, text=f" {hotkey_hint} ", bg=self.BG_CARD_ALT, fg=self.ACCENT_CYAN,
+                font=("Consolas", 8, "bold"), padx=4, pady=1
+            ).pack(side="left", padx=8)
+
+        tk.Label(left, text=subtitle, bg=self.BG_CARD, fg=self.TEXT_MUTED, font=("Segoe UI", 9)).pack(anchor="w", pady=(2, 0))
+
+        sw = ModernToggleSwitch(card, variable=variable, command=command, bg_color=self.BG_CARD)
+        sw.pack(side="right", padx=6)
+
+    # -------------------------------------------------------------------------
+    # PÁGINA 1: COMBATE Y SUPERVIVENCIA
+    # -------------------------------------------------------------------------
+    def _build_page_combat(self, parent):
+        dir_card = tk.Frame(parent, bg=self.BG_CARD, padx=14, pady=10, highlightthickness=1, highlightbackground=self.BORDER_COLOR)
+        dir_card.pack(fill="x", pady=(0, 8))
+        tk.Label(dir_card, text="CARPETA DE INSTALACIÓN DE HOOKSHOT:", bg=self.BG_CARD, fg=self.ACCENT_GOLD, font=("Segoe UI", 8, "bold")).pack(anchor="w")
+
+        dir_row = tk.Frame(dir_card, bg=self.BG_CARD)
+        dir_row.pack(fill="x", pady=(4, 0))
+        tk.Entry(
+            dir_row, textvariable=self.var_game_dir, bg=self.BG_MAIN, fg=self.TEXT_PRIMARY,
+            insertbackground="#ffffff", relief="flat", font=("Consolas", 10)
+        ).pack(side="left", fill="x", expand=True, ipady=5, padx=(0, 8))
+
+        tk.Button(
+            dir_row, text="Examinar...", bg=self.BG_CARD_ALT, fg=self.TEXT_PRIMARY,
+            bd=0, padx=12, pady=5, cursor="hand2", command=self._action_browse_dir
+        ).pack(side="left", padx=2)
+
+        tk.Button(
+            dir_row, text="Configurar hookshot_env.txt", bg="#2563eb", fg="#ffffff",
+            font=("Segoe UI", 9, "bold"), bd=0, padx=12, pady=5, cursor="hand2",
+            command=self._action_configure_env
+        ).pack(side="left", padx=(6, 0))
+
+        self._create_toggle_card(
+            parent,
+            "❤️  Vida Infinita (20 Corazones Llenos)",
+            "Congela la capacidad máxima y actual de corazones en 0x50 (20 corazones) a 20 Hz.",
+            self.var_inf_health, "[F5]", self._sync_cheats
+        )
+        self._create_toggle_card(
+            parent,
+            "✨  Magia Infinita (Barra Doble de Magia)",
+            "Habilita la barra doble de magia y congela el medidor al máximo (0x60) sin agotarse.",
+            self.var_inf_magic, "[F6]", self._sync_cheats
+        )
+        self._create_toggle_card(
+            parent,
+            "🛡️  Modo Dios / Invencible (Sin Daño)",
+            "Activa Heart Protection en el motor y restaura cualquier pérdida de salud al instante.",
+            self.var_god_mode, "[F7]", self._sync_cheats
+        )
+        self._create_toggle_card(
+            parent,
+            "🌙  Salto Lunar / Vuelo Libre (No-Clip & Levitación)",
+            "Activa el vuelo libre del motor (No-Clip Flight) para atravesar o sobrevolar cualquier zona.",
+            self.var_moon_jump, "[F8]", self._sync_cheats
+        )
+        self._create_toggle_card(
+            parent,
+            "💎  Rupias Infinitas (9999) + Munición Infinita (99)",
+            "Mantiene 9999 Rupias, 99 Flechas, Bombas, Bombchus, Semillas, Nueces y Palos Deku.",
+            self.var_inf_rupees, "[F9]", self._sync_cheats
+        )
+
+        dmg_card = tk.Frame(parent, bg=self.BG_CARD, padx=16, pady=12, highlightthickness=1, highlightbackground=self.BORDER_COLOR)
+        dmg_card.pack(fill="x", pady=6)
+        tk.Label(dmg_card, text="⚔️  Multiplicador de Daño y Combate", bg=self.BG_CARD, fg=self.TEXT_PRIMARY, font=("Segoe UI", 11, "bold")).pack(anchor="w")
+        tk.Label(dmg_card, text="Escala el modificador de daño del motor y sincroniza las opciones de combate.", bg=self.BG_CARD, fg=self.TEXT_MUTED, font=("Segoe UI", 9)).pack(anchor="w", pady=(2, 8))
+
+        btn_row = tk.Frame(dmg_card, bg=self.BG_CARD)
+        btn_row.pack(fill="x")
+        self.dmg_buttons = {}
+        for label, mult in [("x1 Normal", 1.0), ("x2 Doble", 2.0), ("x4 Cuádruple", 4.0), ("x8 Brutal", 8.0), ("💀 One-Hit Kill", 255.0)]:
+            b = tk.Button(
+                btn_row, text=label, bd=0, padx=14, pady=7, cursor="hand2",
+                font=("Segoe UI", 9, "bold"),
+                command=lambda m=mult: self._set_damage_multiplier(m)
+            )
+            b.pack(side="left", padx=(0, 8))
+            self.dmg_buttons[mult] = b
+        self._set_damage_multiplier(1.0, log_change=False)
+
+    # -------------------------------------------------------------------------
+    # PÁGINA 2: TELETRANSPORTE LIBRE A 36 ZONAS
+    # -------------------------------------------------------------------------
+    def _build_page_teleport(self, parent):
+        top_card = tk.Frame(parent, bg=self.BG_CARD, padx=14, pady=12, highlightthickness=1, highlightbackground=self.BORDER_COLOR)
+        top_card.pack(fill="x", pady=(0, 10))
+
+        tk.Label(
+            top_card, text="🌀  Teletransporte Instantáneo sin Requisito de Visita Previa",
+            bg=self.BG_CARD, fg=self.TEXT_PRIMARY, font=("Segoe UI", 11, "bold")
+        ).pack(anchor="w")
+
+        ctrl_row = tk.Frame(top_card, bg=self.BG_CARD)
+        ctrl_row.pack(fill="x", pady=(8, 0))
+
+        tk.Label(ctrl_row, text="Edad al llegar:", bg=self.BG_CARD, fg=self.TEXT_MUTED, font=("Segoe UI", 9, "bold")).pack(side="left")
+        for txt, val in [("Mantener actual", "keep"), ("👦 Link Niño", "child"), ("🧑 Link Adulto", "adult")]:
+            tk.Radiobutton(
+                ctrl_row, text=txt, variable=self.var_age_select, value=val,
+                bg=self.BG_CARD, fg=self.TEXT_PRIMARY, selectcolor=self.BG_MAIN,
+                activebackground=self.BG_CARD, font=("Segoe UI", 9, "bold")
+            ).pack(side="left", padx=8)
+
+        tk.Button(
+            ctrl_row, text="⚡ TELETRANSPORTAR AL DESTINO", bg=self.ACCENT_GREEN, fg="#052e16",
+            font=("Segoe UI", 9, "bold"), bd=0, padx=14, pady=6, cursor="hand2",
+            command=self._action_teleport
+        ).pack(side="right")
+
+        filter_row = tk.Frame(parent, bg=self.BG_MAIN)
+        filter_row.pack(fill="x", pady=(0, 6))
+        tk.Label(filter_row, text="🔍 Buscar zona o templo:", bg=self.BG_MAIN, fg=self.TEXT_MUTED, font=("Segoe UI", 9, "bold")).pack(side="left")
+        self.var_tp_search = tk.StringVar()
+        self.var_tp_search.trace_add("write", lambda *_: self._refresh_teleport_tree())
+        tk.Entry(
+            filter_row, textvariable=self.var_tp_search, bg=self.BG_CARD, fg=self.TEXT_PRIMARY,
+            insertbackground="#ffffff", relief="flat", font=("Segoe UI", 10)
+        ).pack(side="left", fill="x", expand=True, padx=8, ipady=4)
+
+        tree_wrap = tk.Frame(parent, bg=self.BG_CARD, highlightthickness=1, highlightbackground=self.BORDER_COLOR)
+        tree_wrap.pack(fill="both", expand=True)
+
+        cols = ("idx", "cat", "name", "map")
+        self.tree_tp = ttk.Treeview(tree_wrap, columns=cols, show="headings", style="Modern.Treeview")
+        self.tree_tp.heading("idx", text="#")
+        self.tree_tp.heading("cat", text="Categoría")
+        self.tree_tp.heading("name", text="Destino / Exterior o Entrada de Templo")
+        self.tree_tp.heading("map", text="ID Mapa")
+
+        self.tree_tp.column("idx", width=45, anchor="center")
+        self.tree_tp.column("cat", width=175, anchor="w")
+        self.tree_tp.column("name", width=390, anchor="w")
+        self.tree_tp.column("map", width=85, anchor="center")
+        self.tree_tp.pack(side="left", fill="both", expand=True)
+        self.tree_tp.bind("<Double-1>", lambda _e: self._action_teleport())
+
+        sb = ttk.Scrollbar(tree_wrap, orient="vertical", command=self.tree_tp.yview)
+        self.tree_tp.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+
+        self._refresh_teleport_tree()
+
+    def _refresh_teleport_tree(self):
+        for item in self.tree_tp.get_children():
+            self.tree_tp.delete(item)
+        q = self.var_tp_search.get().strip().lower()
+        for d in TELEPORT_DESTINATIONS:
+            if not q or q in d["name"].lower() or q in d["cat"].lower():
+                self.tree_tp.insert("", "end", iid=str(d["idx"]), values=(d["idx"], d["cat"], d["name"], f"0x{d['map']:02X} ({d['map']})"))
+
+    # -------------------------------------------------------------------------
+    # PÁGINA 3: ESCÁNER DINÁMICO DE MEMORIA Y DIAGNÓSTICO
+    # -------------------------------------------------------------------------
+    def _build_page_scanner(self, parent):
+        info_card = tk.Frame(parent, bg=self.BG_CARD, padx=16, pady=14, highlightthickness=1, highlightbackground=self.BORDER_COLOR)
+        info_card.pack(fill="x", pady=(0, 10))
+
+        tk.Label(
+            info_card, text="🔍  Escáner Dinámico de Estructura de Link (Auto-Finder v3.0)",
+            bg=self.BG_CARD, fg=self.ACCENT_GOLD, font=("Segoe UI", 12, "bold")
+        ).pack(anchor="w")
+        tk.Label(
+            info_card,
+            text=(
+                "Cuando entras a tu partida ('Continuar'), el Mod Menu busca automáticamente a Link en el Heap.\n"
+                "Deja las casillas vacías para detección 100% automática (3 a 20 corazones), o escribe tus Corazones (ej. 18)\n"
+                "y Flechas visibles en el arco (ej. 17) para filtrar al instante."
+            ),
+            bg=self.BG_CARD, fg=self.TEXT_MUTED, justify="left", font=("Segoe UI", 9)
+        ).pack(anchor="w", pady=(4, 10))
+
+        form = tk.Frame(info_card, bg=self.BG_CARD)
+        form.pack(fill="x")
+
+        tk.Label(form, text="Corazones Máx (vacío=Auto):", bg=self.BG_CARD, fg=self.TEXT_PRIMARY, font=("Segoe UI", 9, "bold")).pack(side="left")
+        tk.Entry(form, textvariable=self.var_scan_hearts, width=6, bg=self.BG_MAIN, fg="#f43f5e", insertbackground="#fff", relief="flat", font=("Consolas", 10)).pack(side="left", padx=(6, 14), ipady=4)
+
+        tk.Label(form, text="Flechas (ej. 17):", bg=self.BG_CARD, fg=self.TEXT_PRIMARY, font=("Segoe UI", 9, "bold")).pack(side="left")
+        tk.Entry(form, textvariable=self.var_scan_arrows, width=6, bg=self.BG_MAIN, fg=self.ACCENT_GREEN, insertbackground="#fff", relief="flat", font=("Consolas", 10)).pack(side="left", padx=(6, 14), ipady=4)
+
+        tk.Label(form, text="Rupias (opc.):", bg=self.BG_CARD, fg=self.TEXT_PRIMARY, font=("Segoe UI", 9, "bold")).pack(side="left")
+        tk.Entry(form, textvariable=self.var_scan_rupees, width=7, bg=self.BG_MAIN, fg=self.ACCENT_CYAN, insertbackground="#fff", relief="flat", font=("Consolas", 10)).pack(side="left", padx=(6, 14), ipady=4)
+
+        tk.Button(
+            form, text="🔎 ESCANEAR HEAP AHORA", bg=self.ACCENT_GOLD, fg="#1e1b4b",
+            font=("Segoe UI", 9, "bold"), bd=0, padx=14, pady=6, cursor="hand2",
+            command=self._action_filtered_scan
+        ).pack(side="left")
+
+        addr_card = tk.Frame(parent, bg=self.BG_CARD, padx=16, pady=14, highlightthickness=1, highlightbackground=self.BORDER_COLOR)
+        addr_card.pack(fill="x", pady=6)
+
+        tk.Label(addr_card, text="📌  Dirección Activa de la Estructura de Link en Memoria", bg=self.BG_CARD, fg=self.TEXT_PRIMARY, font=("Segoe UI", 11, "bold")).pack(anchor="w")
+
+        row_addr = tk.Frame(addr_card, bg=self.BG_CARD)
+        row_addr.pack(fill="x", pady=(8, 4))
+        tk.Label(row_addr, text="Base actual:", bg=self.BG_CARD, fg=self.TEXT_MUTED).pack(side="left")
+        tk.Entry(row_addr, textvariable=self.var_custom_addr, width=22, bg=self.BG_MAIN, fg=self.ACCENT_GREEN, insertbackground="#fff", relief="flat", font=("Consolas", 11, "bold")).pack(side="left", padx=8, ipady=4)
+
+        tk.Button(
+            row_addr, text="Fijar Dirección Manual", bg=self.BG_CARD_ALT, fg=self.TEXT_PRIMARY,
+            bd=0, padx=12, pady=5, cursor="hand2", command=self._action_set_manual_addr
+        ).pack(side="left", padx=4)
+
+        tk.Button(
+            row_addr, text="Perfil 1 (0x107F37C000)", bg=self.BG_CARD_ALT, fg=self.ACCENT_CYAN,
+            bd=0, padx=10, pady=5, cursor="hand2",
+            command=lambda: self._set_preset_addr(0x107F37C000)
+        ).pack(side="left", padx=4)
+
+        tk.Button(
+            row_addr, text="Perfil 2 (0x107C66C000)", bg=self.BG_CARD_ALT, fg=self.ACCENT_CYAN,
+            bd=0, padx=10, pady=5, cursor="hand2",
+            command=lambda: self._set_preset_addr(0x107C66C000)
+        ).pack(side="left", padx=4)
+
+        live_card = tk.Frame(parent, bg=self.BG_CARD, padx=16, pady=14, highlightthickness=1, highlightbackground=self.BORDER_COLOR)
+        live_card.pack(fill="both", expand=True, pady=6)
+        tk.Label(live_card, text="📊  Inspector de Variables de Link en Tiempo Real", bg=self.BG_CARD, fg=self.ACCENT_CYAN, font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(0, 6))
+        self.lbl_inspector = tk.Label(
+            live_card, text="Conecta el juego y carga tu partida para inspeccionar los bytes en tiempo real...",
+            bg=self.BG_MAIN, fg=self.TEXT_PRIMARY, font=("Consolas", 10), justify="left", anchor="nw", padx=12, pady=10
+        )
+        self.lbl_inspector.pack(fill="both", expand=True)
+
+    # -------------------------------------------------------------------------
+    # PÁGINA 4: INVENTARIO, EDAD Y EXTRAS
+    # -------------------------------------------------------------------------
+    def _build_page_extras(self, parent):
+        card = tk.Frame(parent, bg=self.BG_CARD, padx=16, pady=14, highlightthickness=1, highlightbackground=self.BORDER_COLOR)
+        card.pack(fill="x", pady=(0, 10))
+
+        tk.Label(card, text="🎒  Acciones Rápidas y Modificaciones Especiales", bg=self.BG_CARD, fg=self.ACCENT_GOLD, font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=(0, 10))
+
+        actions = [
+            ("🗡️  Desbloquear Todo el Inventario (85 Objetos, Espadas, Túnicas, Botas y Medallones)", self.ACCENT_GREEN, "#052e16", self._action_unlock_all),
+            ("⏳  Alternar Edad de Link en Vivo (Niño ↔ Adulto sin ir al Templo del Tiempo)", self.ACCENT_GOLD, "#1e1b4b", self._action_switch_age),
+            ("💖  Inyectar 20 Corazones + 9999 Rupias + 99 Munición (Instantáneo)", "#2563eb", "#ffffff", self._action_instant_max),
+            ("👻  Activar / Desactivar Vuelo Libre (No-Clip Flight de Hookshot Debug)", "#9333ea", "#ffffff", self._action_toggle_noclip),
+        ]
+        for text, bg_c, fg_c, cmd in actions:
+            tk.Button(
+                card, text=text, bg=bg_c, fg=fg_c, font=("Segoe UI", 10, "bold"),
+                bd=0, pady=10, cursor="hand2", command=cmd
+            ).pack(fill="x", pady=5)
+
+    # -------------------------------------------------------------------------
+    # PÁGINA 5: CONSOLA DE LOGS EN TIEMPO REAL
+    # -------------------------------------------------------------------------
+    def _build_page_logs(self, parent):
+        top = tk.Frame(parent, bg=self.BG_CARD, padx=12, pady=8, highlightthickness=1, highlightbackground=self.BORDER_COLOR)
+        top.pack(fill="x", pady=(0, 6))
+
+        tk.Label(top, text="📟  Registro de Diagnóstico en Vivo (hookshot_modmenu_debug.log)", bg=self.BG_CARD, fg=self.ACCENT_GOLD, font=("Segoe UI", 10, "bold")).pack(side="left")
+
+        tk.Button(
+            top, text="Limpiar Consola", bg=self.BG_CARD_ALT, fg=self.TEXT_PRIMARY,
+            bd=0, padx=10, pady=4, cursor="hand2", command=self._clear_logs
+        ).pack(side="right", padx=4)
+
+        tk.Button(
+            top, text="Probar Conexión y Volcar Diagnóstico", bg=self.ACCENT_CYAN, fg="#083344",
+            font=("Segoe UI", 9, "bold"), bd=0, padx=12, pady=4, cursor="hand2",
+            command=self._action_run_diagnostics
+        ).pack(side="right", padx=4)
+
+        self.txt_logs = tk.Text(
+            parent, bg="#070a0f", fg="#e2e8f0", insertbackground="#ffffff",
+            font=("Consolas", 9), relief="flat", padx=10, pady=10, state="disabled"
+        )
+        self.txt_logs.pack(fill="both", expand=True)
+        self.txt_logs.tag_config("INFO", foreground="#93c5fd")
+        self.txt_logs.tag_config("OK", foreground="#34d399")
+        self.txt_logs.tag_config("WARN", foreground="#fbbf24")
+        self.txt_logs.tag_config("ERROR", foreground="#f87171")
+
+    def _on_new_log_line(self, level, line):
+        def _append():
+            self.txt_logs.configure(state="normal")
+            self.txt_logs.insert("end", line + "\n", level)
+            self.txt_logs.see("end")
+            self.txt_logs.configure(state="disabled")
+        try:
+            self.root.after(0, _append)
+        except Exception:
+            pass
+
+    def _clear_logs(self):
+        self.txt_logs.configure(state="normal")
+        self.txt_logs.delete("1.0", "end")
+        self.txt_logs.configure(state="disabled")
+
+    # -------------------------------------------------------------------------
+    # ACCIONES Y EVENTOS
+    # -------------------------------------------------------------------------
+    def _sync_cheats(self):
+        self.ctrl.inf_health = self.var_inf_health.get()
+        self.ctrl.inf_magic = self.var_inf_magic.get()
+        self.ctrl.god_mode = self.var_god_mode.get()
+        self.ctrl.moon_jump = self.var_moon_jump.get()
+        self.ctrl.inf_rupees_ammo = self.var_inf_rupees.get()
+
+        active = []
+        if self.ctrl.inf_health: active.append("Vida Infinita")
+        if self.ctrl.inf_magic: active.append("Magia Infinita")
+        if self.ctrl.god_mode: active.append("Modo Dios")
+        if self.ctrl.moon_jump: active.append("Salto Lunar / Vuelo")
+        if self.ctrl.inf_rupees_ammo: active.append("Rupias/Munición Inf.")
+        self.logger.info(f"Módulos activos actualizados: {', '.join(active) if active else 'Ninguno'}")
+
+        if self.ctrl.god_mode:
+            self.ctrl.set_option_via_bridge("heart_protection", 1)
+        if self.ctrl.moon_jump:
+            self.ctrl.set_option_via_bridge("no_clip_flight", 1)
+
+    def _set_damage_multiplier(self, mult, log_change=True):
+        self.var_dmg_mult.set(mult)
+        self.ctrl.damage_mult = mult
+        for m, btn in self.dmg_buttons.items():
+            if m == mult:
+                btn.configure(bg=self.ACCENT_GOLD, fg="#1e1b4b")
+            else:
+                btn.configure(bg=self.BG_CARD_ALT, fg=self.TEXT_PRIMARY)
+        if log_change:
+            self.logger.ok(f"Multiplicador de daño fijado en x{int(mult)}")
+            self.ctrl.set_option_via_bridge("damage_multiplier", int(mult))
+
+    def _action_browse_dir(self):
+        chosen = filedialog.askdirectory(title="Selecciona la carpeta de instalación de Hookshot")
+        if chosen:
+            self.var_game_dir.set(chosen)
+            self.ctrl.bridge.set_game_dir(chosen)
+            self.logger.info(f"Carpeta de Hookshot seleccionada: {chosen}")
+
+    def _action_configure_env(self):
+        self.ctrl.bridge.set_game_dir(self.var_game_dir.get().strip())
+        ok, msg = self.ctrl.bridge.configure_game_environment()
+        if ok:
+            messagebox.showinfo("Configuración Aplicada", msg)
+        else:
+            messagebox.showwarning("Aviso", msg)
+
+    def _action_launch_game(self):
+        ok, msg = self.ctrl.launch_game_with_bridge(self.var_game_dir.get().strip())
+        if not ok:
+            self._switch_page("logs")
+            messagebox.showwarning("No se pudo iniciar", msg)
+
+    def _action_relaunch_admin(self):
+        if not sys.platform.startswith("win"):
+            return
+        try:
+            script_path = os.path.abspath(__file__)
+            ctypes.windll.shell32.ShellExecuteW(
+                None, "runas", sys.executable, f'"{script_path}" --elevated', None, 1
+            )
+            self.root.destroy()
+        except Exception as e:
+            self.logger.err(f"No se pudo elevar a Administrador: {e}")
+
+    def _action_auto_scan(self):
+        self._switch_page("scanner")
+        threading.Thread(target=self._run_scan_thread, args=(None, None, None), daemon=True).start()
+
+    def _action_filtered_scan(self):
+        rup_s = self.var_scan_rupees.get().strip()
+        hrt_s = self.var_scan_hearts.get().strip()
+        arr_s = self.var_scan_arrows.get().strip()
+        rup = int(rup_s) if rup_s.isdigit() else None
+        hrt = int(hrt_s) if hrt_s.isdigit() else None
+        arr = int(arr_s) if arr_s.isdigit() else None
+        threading.Thread(target=self._run_scan_thread, args=(rup, hrt, arr), daemon=True).start()
+
+    def _run_scan_thread(self, rup, hrt, arr):
+        found = self.ctrl.mem.scan_player_struct(known_rupees=rup, known_hearts=hrt, known_arrows=arr)
+        if found:
+            self.var_custom_addr.set(f"0x{self.ctrl.mem.player_struct_addr:X}")
+
+    def _action_set_manual_addr(self):
+        raw = self.var_custom_addr.get().strip()
+        try:
+            addr = int(raw, 16) if raw.lower().startswith("0x") else int(raw)
+            self.ctrl.mem.player_struct_addr = addr
+            self.ctrl.mem.struct_verified = self.ctrl.mem._is_valid_player_struct(addr)
+            self.logger.ok(f"Dirección base fijada manualmente en 0x{addr:X} (Verificada={self.ctrl.mem.struct_verified})")
+        except Exception:
+            messagebox.showwarning("Formato inválido", "Introduce una dirección hexadecimal válida (ej. 0x107F37C000).")
+
+    def _set_preset_addr(self, addr):
+        self.ctrl.mem.player_struct_addr = addr
+        self.ctrl.mem.struct_verified = self.ctrl.mem._is_valid_player_struct(addr)
+        self.var_custom_addr.set(f"0x{addr:X}")
+        self.logger.info(f"Cambiado al perfil de memoria 0x{addr:X} (Verificada={self.ctrl.mem.struct_verified})")
+
+    def _action_teleport(self):
+        sel = self.tree_tp.selection()
+        if not sel:
+            messagebox.showinfo("Selecciona un destino", "Haz clic en cualquier lugar de la tabla para teletransportarte.")
+            return
+        idx = int(sel[0])
+        dest = next((d for d in TELEPORT_DESTINATIONS if d["idx"] == idx), None)
+        if not dest:
+            return
+        self.ctrl.bridge.set_game_dir(self.var_game_dir.get().strip())
+        ok, msg = self.ctrl.bridge.teleport(dest, age_mode=self.var_age_select.get())
+        self.logger.ok(msg)
+
+    def _action_unlock_all(self):
+        self.ctrl.bridge.set_game_dir(self.var_game_dir.get().strip())
+        self.ctrl.unlock_all_items_live()
+
+    def _action_switch_age(self):
+        cur = self.var_age_select.get()
+        nxt = "adult" if cur != "adult" else "child"
+        self.var_age_select.set(nxt)
+        self.ctrl.bridge.set_game_dir(self.var_game_dir.get().strip())
+        self.ctrl.bridge.send_bridge_command({"cmd": "age", "age": nxt})
+        self.ctrl.bridge.append_live_command(f"!age {nxt}")
+        self.logger.ok(f"Orden de cambio de edad enviada: Link {nxt.upper()}")
+
+    def _action_instant_max(self):
+        if self.ctrl.mem.attach():
+            if not self.ctrl.mem.struct_verified:
+                self.ctrl.mem.scan_player_struct()
+            for f in ("max_health_1", "max_health_2", "max_health_3", "cur_health_1", "cur_health_2", "cur_health_3"):
+                self.ctrl.mem.write_u32(self.ctrl.mem.get_field_addr(f), 0x50, log_write=True)
+            self.ctrl.mem.write_u32(self.ctrl.mem.get_field_addr("rupees"), 9999, log_write=True)
+            self.ctrl.mem.write_u32(self.ctrl.mem.get_field_addr("arrows"), 99)
+            self.ctrl.mem.write_u32(self.ctrl.mem.get_field_addr("bombs"), 99)
+        else:
+            self.logger.warn("Juego no conectado en memoria. Enviando por HOS_INPUT_LIVE.")
+            self.ctrl.bridge.append_live_command("!cheat refill")
+
+    def _action_toggle_noclip(self):
+        self.ctrl.no_clip = not self.ctrl.no_clip
+        val = 1 if self.ctrl.no_clip else 0
+        self.ctrl.set_option_via_bridge("no_clip_flight", val)
+        self.ctrl.bridge.append_live_command(f"!cheat flight_{val}")
+        self.logger.ok(f"Vuelo No-Clip {'ACTIVADO' if val else 'DESACTIVADO'}")
+
+    def _action_run_diagnostics(self):
+        self.logger.info("=== INICIANDO DIAGNÓSTICO COMPLETO DE HOOKSHOT v3.0 ===")
+        procs = self.ctrl.mem.list_candidate_processes()
+        if not procs:
+            self.logger.warn("No se detectó ningún proceso hookshot.exe en ejecución.")
+            return
+        for p in procs:
+            self.logger.info(
+                f"Candidato PID {p['pid']}: {p['path']} | "
+                f"RAM Comprometida: {p['committed_mb']} MB | Virtual Reservada: {p['reserved_gb']:.1f} GB"
+            )
+        if self.ctrl.mem.attach():
+            regs = self.ctrl.mem.enumerate_committed_rw_regions(include_all_address_space=True)
+            total_mb = sum(s for _, s in regs) / (1024 * 1024)
+            self.logger.ok(f"Regiones RW comprometidas totales: {len(regs)} bloques ({total_mb:.1f} MB)")
+            base = self.ctrl.mem.player_struct_addr
+            vals = {k: self.ctrl.mem.read_u32(base + off) for k, off in STRUCT_OFFSETS.items()}
+            self.logger.info(f"Lectura en base actual 0x{base:X}: {vals}")
+
+    def _bind_hotkeys(self):
+        self.root.bind("<F5>", lambda _e: self._hotkey_flip(self.var_inf_health))
+        self.root.bind("<F6>", lambda _e: self._hotkey_flip(self.var_inf_magic))
+        self.root.bind("<F7>", lambda _e: self._hotkey_flip(self.var_god_mode))
+        self.root.bind("<F8>", lambda _e: self._hotkey_flip(self.var_moon_jump))
+        self.root.bind("<F9>", lambda _e: self._hotkey_flip(self.var_inf_rupees))
+
+    def _hotkey_flip(self, var):
+        var.set(not var.get())
+        self._sync_cheats()
+
+    def _ui_refresh_loop(self):
+        if self.ctrl.mem.is_attached():
+            if self.ctrl.mem.struct_verified:
+                self.var_tele_pid.set(f"CONECTADO (PID {self.ctrl.mem.pid})")
+                self.badge_pid.configure(fg=self.ACCENT_GREEN)
+                chp = self.ctrl.live_cur_hp / 4.0
+                mhp = self.ctrl.live_max_hp / 4.0
+                self.var_tele_hp.set(f"{chp:.1f} / {mhp:.0f} ♥")
+                self.var_tele_magic.set(f"{self.ctrl.live_magic} / 96")
+                self.var_tele_rupees.set(f"{self.ctrl.live_rupees}")
+                self.var_tele_cycles.set(f"{self.ctrl.write_cycles}")
+                status_str = f"VERIFICADA (Slot #{self.ctrl.mem.active_health_slot})"
+            else:
+                self.var_tele_pid.set(f"EN MENÚ / CARGANDO (PID {self.ctrl.mem.pid})")
+                self.badge_pid.configure(fg=self.ACCENT_GOLD)
+                self.var_tele_hp.set("ESPERANDO PARTIDA")
+                self.var_tele_magic.set("--")
+                self.var_tele_rupees.set("--")
+                chp = 0.0
+                mhp = 0.0
+                status_str = "ESPERANDO QUE ENTRES A LA PARTIDA ('Continuar') O USES EL ESCÁNER"
+
+            base = self.ctrl.mem.player_struct_addr
+            self.var_custom_addr.set(f"0x{base:X}")
+            inspector_txt = (
+                f"Proceso Adjunto        : {self.ctrl.mem.process_name} (PID: {self.ctrl.mem.pid})\n"
+                f"Ruta del Ejecutable    : {self.ctrl.mem.exe_full_path or 'bin/hookshot.exe'}\n"
+                f"Base Estructura Link   : 0x{base:012X}  ({status_str})\n"
+                f"Corazones (Actual/Máx) : {self.ctrl.live_cur_hp} / {self.ctrl.live_max_hp}  ({chp:.2f} / {mhp:.0f} corazones)\n"
+                f"Magia Actual           : {self.ctrl.live_magic}  (0x{self.ctrl.live_magic:02X})\n"
+                f"Rupias (+0x134)        : {self.ctrl.live_rupees}\n"
+                f"Flechas (+0x814)       : {self.ctrl.live_arrows}   |   Bombas (+0x83C) : {self.ctrl.live_bombs}\n"
+                f"Puente HOS_INPUT_LIVE  : {self.ctrl.bridge.live_file_path}\n"
+                f"Socket HOS_CONTROL     : {self.ctrl.bridge.socket_path}"
+            )
+            self.lbl_inspector.configure(text=inspector_txt)
+        else:
+            self.var_tele_pid.set("ESPERANDO JUEGO...")
+            self.badge_pid.configure(fg=self.ACCENT_GOLD)
+            self.var_tele_hp.set("-- / --")
+            self.var_tele_magic.set("--")
+            self.var_tele_rupees.set("--")
+
+        self.root.after(400, self._ui_refresh_loop)
+
+
+def ensure_windows_admin():
+    """
+    Si el usuario abre el script con doble clic en Windows sin permisos de
+    Administrador, solicita elevación UAC automáticamente una sola vez.
+    """
+    if not sys.platform.startswith("win"):
+        return
+    if "--elevated" in sys.argv or "--no-elevate" in sys.argv:
+        return
+    try:
+        if not ctypes.windll.shell32.IsUserAnAdmin():
+            script_path = os.path.abspath(__file__)
+            res = ctypes.windll.shell32.ShellExecuteW(
+                None, "runas", sys.executable, f'"{script_path}" --elevated', None, 1
+            )
+            if int(res) > 32:
+                sys.exit(0)
+    except Exception:
+        pass
+
+
+def main():
+    ensure_windows_admin()
+    root = tk.Tk()
+    app = HookshotModernGUI(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

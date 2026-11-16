@@ -1,0 +1,28 @@
+=== Hookshot v2.2.0-rc.1 Zelda Menu Log (2026-11-14T23:48:56.249392) ===
+[23:48:56.423] [OK] Enganchado a hookshot.exe en memoria [PID: 7980]
+[23:49:00.267] [INFO] Escaneando memoria de Link...
+[23:49:00.356] [OK] Estructura de Link localizada en 0x101002410CA8
+[23:49:00.357] [OK] Link sincronizado en 0x101002410CA8
+[23:49:17.402] [OK] ¡Link transformado en CHILD!
+[23:49:35.352] [OK] ¡Link transformado en ADULT!
+[23:50:28.365] [OK] Multiplicador de daño fijado en 2.0x (x2 Doble Daño).
+[23:50:28.612] [OK] Multiplicador de daño fijado en 4.0x (x4 Cuádruple).
+[23:51:11.205] [OK] Velocidad del juego fijada en 1.5x.
+[23:51:12.817] [OK] Velocidad del juego fijada en 2.0x.
+[23:51:13.594] [OK] Velocidad del juego fijada en 0.5x.
+[23:51:14.196] [OK] Velocidad del juego fijada en 1.0x.
+[23:51:14.822] [OK] Velocidad del juego fijada en 1.5x.
+[23:51:15.092] [OK] Velocidad del juego fijada en 2.0x.
+[23:53:15.954] [INFO] Desbloqueando los 85 objetos del inventario de Ocarina of Time...
+[23:53:18.997] [OK] ¡Desbloqueo completo de inventario finalizado!
+[23:54:39.967] [OK] ¡Recarga al 100% completada!
+[23:54:40.847] [OK] ¡Recarga al 100% completada!
+[23:54:41.745] [OK] ¡Recarga al 100% completada!
+[23:54:42.637] [OK] ¡Recarga al 100% completada!
+[23:54:43.589] [OK] ¡Recarga al 100% completada!
+[23:54:44.529] [OK] ¡Recarga al 100% completada!
+[23:54:59.949] [OK] Entorno de Hookshot configurado al 100%.
+[23:55:06.465] [INFO] Escaneando memoria de Link...
+[23:55:06.559] [OK] Estructura de Link localizada en 0x101002410CA8
+[23:55:06.560] [OK] Link sincronizado en 0x101002410CA8
+[23:55:10.215] [OK] ¡Recarga al 100% completada!
